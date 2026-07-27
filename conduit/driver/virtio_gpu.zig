@@ -24,12 +24,10 @@
 const builtin = @import("builtin");
 const Mmio = @import("../mmio.zig");
 const match = @import("../match.zig");
+const virtio_pci = @import("virtio_pci.zig");
 
 pub const matcher = match.Matcher{
-    // virtio-gpu is a display device, but conduit has no .display class yet. So
-    // discovery uses the same virtio,mmio compatible the device exposes. A
-    // consumer narrows to GPU by reading R_DEVICE_ID after binding.
-    .class = .pci,
+    .class = .display,
     .dt_compatible = &.{"virtio,mmio"},
     .driver = "virtio_gpu",
 };
@@ -240,6 +238,9 @@ pub const Display = struct { width: u32 = 0, height: u32 = 0 };
 
 pub const Virtio = struct {
     mmio: Mmio,
+    /// When set, handshake / notify / ISR go through virtio-pci instead of
+    /// virtio-mmio register offsets.
+    pci: ?virtio_pci.Transport = null,
     present_ok: bool = false,
     last_used: u16 = 0,
     // When true, `start` accepts VIRTIO_GPU_F_VIRGL, so the device exposes the 3D
@@ -264,6 +265,11 @@ pub const Virtio = struct {
     /// Run the virtio handshake and program the control queue. Returns true if a
     /// v2 virtio-gpu device is ready. Call it on the struct's final address.
     pub fn start(self: *Virtio) bool {
+        if (self.pci != null) return self.startPci();
+        return self.startMmio();
+    }
+
+    fn startMmio(self: *Virtio) bool {
         if (self.mmio.read(u32, R_MAGIC) != MAGIC) return false;
         if (self.mmio.read(u32, R_DEVICE_ID) != DEVICE_ID_GPU) return false;
         if (self.mmio.read(u32, R_VERSION) != 2) return false; // modern only
@@ -316,6 +322,49 @@ pub const Virtio = struct {
         return true;
     }
 
+    fn startPci(self: *Virtio) bool {
+        const t = self.pci orelse return false;
+        t.reset();
+
+        var status: u8 = virtio_pci.S_ACKNOWLEDGE;
+        t.setStatus(status);
+        status |= virtio_pci.S_DRIVER;
+        t.setStatus(status);
+
+        // Modern PCI virtio already implies VIRTIO_F_VERSION_1; still negotiate it.
+        t.setDriverFeatures(1, F_VERSION_1_HI);
+        var lo: u32 = 0;
+        if (self.want_virgl) {
+            const dev_lo = t.deviceFeatures(0);
+            if (dev_lo & F_VIRGL_LO != 0) {
+                lo |= F_VIRGL_LO;
+                self.virgl_ok = true;
+            }
+        }
+        t.setDriverFeatures(0, lo);
+
+        status |= virtio_pci.S_FEATURES_OK;
+        t.setStatus(status);
+        if (t.status() & virtio_pci.S_FEATURES_OK == 0) return false;
+
+        self.avail = .{ .flags = 0, .idx = 0, .ring = [_]u16{0} ** QSIZE, .used_event = 0 };
+        self.used = .{ .flags = 0, .idx = 0, .ring = [_]UsedElem{.{ .id = 0, .len = 0 }} ** QSIZE, .avail_event = 0 };
+        self.last_used = 0;
+
+        if (!t.setQueue(
+            @intCast(VQ_CONTROL),
+            QSIZE,
+            @intFromPtr(&self.desc),
+            @intFromPtr(&self.avail),
+            @intFromPtr(&self.used),
+        )) return false;
+
+        status |= virtio_pci.S_DRIVER_OK;
+        t.setStatus(status);
+        self.present_ok = true;
+        return true;
+    }
+
     fn setQueueAddr(self: *Virtio, off: usize, addr: usize) void {
         self.mmio.write(u32, off, @truncate(addr));
         self.mmio.write(u32, off + 4, @truncate(addr >> 32));
@@ -324,6 +373,25 @@ pub const Virtio = struct {
     /// Submit a request/response pair on the control queue. Block until the
     /// device returns the descriptor. This copies `req` into the DMA request
     /// buffer. It returns the response header type (0 on timeout).
+    fn notifyControl(self: *Virtio) void {
+        if (self.pci) |t| {
+            t.notify(@intCast(VQ_CONTROL));
+        } else {
+            self.mmio.write(u32, R_QUEUE_NOTIFY, VQ_CONTROL);
+        }
+    }
+
+    fn ackInterrupt(self: *Virtio) void {
+        if (self.pci) |t| {
+            t.ackInterrupt();
+        } else {
+            self.mmio.write(u32, R_INTERRUPT_ACK, self.mmio.read(u32, R_INTERRUPT_STATUS));
+        }
+    }
+
+    /// Submit a request/response pair on the control queue and block until the
+    /// device returns the descriptor. `req` is copied into the DMA request
+    /// buffer, and the response header type is returned (0 on timeout).
     fn submit(self: *Virtio, req: []const u8, resp_len: usize) u32 {
         @memcpy(self.req_buf[0..req.len], req);
 
@@ -344,13 +412,13 @@ pub const Virtio = struct {
         barrier();
         self.avail.idx +%= 1;
         barrier();
-        self.mmio.write(u32, R_QUEUE_NOTIFY, VQ_CONTROL);
+        self.notifyControl();
 
         while (@atomicLoad(u16, &self.used.idx, .acquire) == self.last_used) {
             asm volatile ("" ::: .{ .memory = true });
         }
         self.last_used = self.used.idx;
-        self.mmio.write(u32, R_INTERRUPT_ACK, self.mmio.read(u32, R_INTERRUPT_STATUS));
+        self.ackInterrupt();
 
         const hdr: *align(16) const GpuHdr = @ptrCast(&self.resp_buf);
         return hdr.type;
@@ -388,13 +456,13 @@ pub const Virtio = struct {
         barrier();
         self.avail.idx +%= 1;
         barrier();
-        self.mmio.write(u32, R_QUEUE_NOTIFY, VQ_CONTROL);
+        self.notifyControl();
 
         while (@atomicLoad(u16, &self.used.idx, .acquire) == self.last_used) {
             asm volatile ("" ::: .{ .memory = true });
         }
         self.last_used = self.used.idx;
-        self.mmio.write(u32, R_INTERRUPT_ACK, self.mmio.read(u32, R_INTERRUPT_STATUS));
+        self.ackInterrupt();
 
         const hdr: *align(16) const GpuHdr = @ptrCast(&self.resp_buf);
         return hdr.type;
@@ -632,6 +700,12 @@ pub const virgl = struct {
 /// Fill a `Virtio` over `mmio`. Call `start` once it is at its final address.
 pub fn bind(mmio: Mmio) Virtio {
     return .{ .mmio = mmio };
+}
+
+/// Fill a `Virtio` over a virtio-pci transport. Call `start` once it is at its
+/// final address. `mmio` is unused on this path (left as a zero direct window).
+pub fn bindPci(transport: virtio_pci.Transport) Virtio {
+    return .{ .mmio = Mmio.direct(0), .pci = transport };
 }
 
 /// Like `bind`, but requests the VIRTIO_GPU_F_VIRGL feature so `start` brings up
