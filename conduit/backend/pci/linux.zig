@@ -83,7 +83,7 @@ pub const LinuxPciBackend = struct {
         if (self.cur_name_len == 0) return;
 
         var path_buf: [128]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/resource", .{ sysfs_root, self.cur_name[0..self.cur_name_len] }) catch return;
+        const path = std.mem.printSentinel(&path_buf, "{s}/{s}/resource", .{ sysfs_root, self.cur_name[0..self.cur_name_len] }, 0) catch return;
 
         var file_buf: [4096]u8 = undefined;
         const n = readFile(path, &file_buf) orelse return;
@@ -189,7 +189,7 @@ fn parseHex(comptime T: type, s: []const u8) ?T {
 /// Read a sysfs hex attribute file ("0x....\n") for device `name`.
 fn readHexAttr(name: []const u8, attr: []const u8) ?u64 {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}", .{ sysfs_root, name, attr }) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "{s}/{s}/{s}", .{ sysfs_root, name, attr }, 0) catch return null;
     var buf: [32]u8 = undefined;
     const n = readFile(path, &buf) orelse return null;
     var text = buf[0..n];
