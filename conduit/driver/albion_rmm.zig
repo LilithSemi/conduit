@@ -133,7 +133,7 @@ pub const Host = struct {
         const data = self.mmio.read(u32, RSP_DATA);
         self.mmio.write(u32, RSP_POP, 1);
         return .{
-            .status = @enumFromInt(@as(u8, @truncate((head >> 1) & 0xff))),
+            .status = @fromBackingInt(@as(u8, @truncate((head >> 1) & 0xff))),
             .data = data,
         };
     }
@@ -219,7 +219,7 @@ const MockRmm = struct {
     rsp_valid: bool = false,
     rsp_status: u8 = 0,
     rsp_data: u32 = 0,
-    states: [16]u8 = [_]u8{0} ** 16, // 0 null, 1 configuring, 2 active
+    states: [16]u8 = @splat(0), // 0 null, 1 configuring, 2 active
 
     fn process(m: *MockRmm) void {
         const op = m.op & 0xff;

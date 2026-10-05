@@ -73,7 +73,7 @@ pub const HarborSdio = struct {
     num_blocks: u64 = 0,
     present: bool = false,
     // Card identity, captured from the ALL_SEND_CID R2 response at bring-up.
-    cid: sd.Cid = .{ .raw = [_]u8{0} ** 16 },
+    cid: sd.Cid = .{ .raw = @splat(0) },
     // ADMA descriptor for one transfer: [buffer addr], [len[15:0] | end<<31].
     // It lives in the instance (DRAM in M-mode) so it has a stable physical
     // address the DMA master can fetch. 8-byte aligned for the two-word fetch.
@@ -81,7 +81,7 @@ pub const HarborSdio = struct {
     // Aligned bounce buffer, one multi-block chunk wide. The ADMA moves 32-bit
     // beats to and from a physical address, so it needs an aligned target the
     // caller's `buf` may not give.
-    bounce: [CHUNK_BLOCKS * BLOCK_LEN]u8 align(8) = [_]u8{0} ** (CHUNK_BLOCKS * BLOCK_LEN),
+    bounce: [CHUNK_BLOCKS * BLOCK_LEN]u8 align(8) = @splat(0),
 
     const CTRL = 0x00;
     const STATUS = 0x08;
@@ -205,7 +205,7 @@ pub const HarborSdio = struct {
     }
 
     fn setCtrl(self: *HarborSdio, width: BusWidth) void {
-        const w: u32 = @intFromEnum(width);
+        const w: u32 = @backingInt(width);
         self.mmio.write(u32, CTRL, CTRL_ENABLE | (w << CTRL_WIDTH_SHIFT));
     }
 
@@ -587,7 +587,7 @@ const FakeHost = struct {
     /// 8.0, PSN 0x11223344, made 2021-09.
     cid: [4]u32 = .{ 0x44015900, 0x80112233, 0x43363447, 0x03534453 },
     // The card's one-block backing store, plus a note of what the driver did.
-    media: [512]u8 = [_]u8{0} ** 512,
+    media: [512]u8 = @splat(0),
     reads: usize = 0,
     writes: usize = 0,
     last_addr: u32 = 0,

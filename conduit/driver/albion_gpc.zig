@@ -54,7 +54,7 @@ pub const Gpc = struct {
         self.mmio.write(u32, ARG_WORLD, world);
         self.mmio.write(u32, CMD, op);
         while (self.mmio.read(u32, RESULT) & 0x1 != 0) {}
-        return @enumFromInt(@as(u8, @truncate((self.mmio.read(u32, RESULT) >> 4) & 0xf)));
+        return @fromBackingInt(@as(u8, @truncate((self.mmio.read(u32, RESULT) >> 4) & 0xf)));
     }
 
     pub fn createRealm(self: Gpc, realm: u8) Result {

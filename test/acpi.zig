@@ -19,7 +19,7 @@ fn buildTables(buf: []u8) !almanac.TablesGeneric(almanac.OffsetMapper) {
     var b = almanac.Builder.init(buf, @intFromPtr(buf.ptr));
 
     // SPCR: ns16550a at system-memory 0x1000_0000, GSI 10.
-    var spcr: [22]u8 = [_]u8{0} ** 22;
+    var spcr: [22]u8 = @splat(0);
     spcr[0] = 0x00; // interface type: full 16550
     spcr[4] = 0; // GAS address space: system memory
     std.mem.writeInt(u64, spcr[8..16], 0x1000_0000, .little); // GAS address
@@ -28,14 +28,14 @@ fn buildTables(buf: []u8) !almanac.TablesGeneric(almanac.OffsetMapper) {
     const spcr_phys = try b.addTable("SPCR", &spcr, 2);
 
     // MCFG: one ECAM allocation, base 0xE000_0000, bus 0..0.
-    var mcfg: [24]u8 = [_]u8{0} ** 24;
+    var mcfg: [24]u8 = @splat(0);
     std.mem.writeInt(u64, mcfg[8..16], 0xE000_0000, .little); // base_address
     mcfg[18] = 0; // start_bus
     mcfg[19] = 0; // end_bus
     const mcfg_phys = try b.addTable("MCFG", &mcfg, 1);
 
     // MADT: one I/O APIC at 0xFEC0_0000.
-    var madt: [20]u8 = [_]u8{0} ** 20;
+    var madt: [20]u8 = @splat(0);
     // madt[0..4] local apic addr, madt[4..8] flags, madt[8..] entries.
     madt[8] = 0x01; // type: I/O APIC
     madt[9] = 12; // length

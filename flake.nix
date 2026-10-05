@@ -58,7 +58,7 @@
           default = pkgs.mkShell {
             name = "conduit-dev-shell";
             packages = with pkgs; [
-              zig
+              zig_0_17
             ];
           };
         }
@@ -75,13 +75,13 @@
 
             src = lib.cleanSource ./.;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-YH4uOTmAcrA4dzzk6pgodfg5CfHmuH3486UPvuk56DY=";
+              hash = "sha256-a/O6AVRth3jHSO35rYamdWFCj8KcbrX5v8rSlldaPjk=";
             };
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             postConfigure = ''

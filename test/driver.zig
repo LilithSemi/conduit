@@ -10,7 +10,7 @@ const pl011 = @import("conduit").driver.pl011;
 /// A byte-addressed fake register file. It forces `ready_off`/`ready_bit` high so
 /// polling writes never spin.
 const FakeRegs = struct {
-    buf: [256]u8 = [_]u8{0} ** 256,
+    buf: [256]u8 = @splat(0),
     ready_off: usize,
     ready_bit: u8,
 

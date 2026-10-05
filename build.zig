@@ -16,11 +16,14 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "have_almanac", want_almanac);
     options.addOption(bool, "have_pci", want_pci);
 
-    // The dtree and almanac backends are lazy. A consumer that disables them never
-    // fetches them. For example, a firmware with a static memory map needs only the
-    // Mmio HAL. Zig resolves a backend only when the build wants it.
-    const dtree_dep = if (want_dtree) b.dependency("dtree", .{ .target = target, .optimize = optimize }) else null;
-    const almanac_dep = if (want_almanac) b.dependency("almanac", .{ .target = target, .optimize = optimize }) else null;
+    const dtree_dep = if (want_dtree) b.dependency("dtree", .{
+        .target = target,
+        .optimize = optimize,
+    }) else null;
+    const almanac_dep = if (want_almanac) b.dependency("almanac", .{
+        .target = target,
+        .optimize = optimize,
+    }) else null;
 
     const conduit = b.addModule("conduit", .{
         .root_source_file = b.path("conduit.zig"),

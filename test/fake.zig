@@ -11,7 +11,7 @@ pub fn Flat(comptime N: usize) type {
         const Self = @This();
         pub const no_force = ~@as(usize, 0);
 
-        buf: [N]u8 = [_]u8{0} ** N,
+        buf: [N]u8 = @splat(0),
         force_off: usize = no_force,
         force_val: u64 = 0,
 

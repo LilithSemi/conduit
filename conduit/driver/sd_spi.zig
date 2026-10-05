@@ -68,7 +68,7 @@ pub const SdSpi = struct {
     num_blocks: u64 = 0,
     present: bool = false,
     /// Card Identification register (CMD10): manufacturer/OEM/product/serial/date.
-    cid: [16]u8 = [_]u8{0} ** 16,
+    cid: [16]u8 = @splat(0),
 
     /// CRC7 (poly 0x09) over the command bytes. It fills the trailing frame byte.
     /// The card checks only CMD0 and CMD8 in SPI mode. A correct CRC is cheap and
@@ -393,9 +393,9 @@ const FakeCard = struct {
     const DMA_START: u64 = 1 << 0;
 
     collecting: bool = false,
-    cmd_buf: [6]u8 = [_]u8{0} ** 6,
+    cmd_buf: [6]u8 = @splat(0),
     cmd_len: u8 = 0,
-    resp: [700]u8 = [_]u8{0} ** 700,
+    resp: [700]u8 = @splat(0),
     head: usize = 0,
     tail: usize = 0,
     last_in: u8 = 0xFF,
@@ -457,7 +457,7 @@ const FakeCard = struct {
             9 => { // CMD9 -> CSD v2, C_SIZE = 0x1FFF -> 8388608 blocks (4 GiB)
                 self.push(0x00);
                 self.push(TOKEN_START);
-                var csd = [_]u8{0} ** 16;
+                var csd: [16]u8 = @splat(0);
                 csd[0] = 0x40; // CSD structure v2
                 csd[7] = 0x00;
                 csd[8] = 0x1F;

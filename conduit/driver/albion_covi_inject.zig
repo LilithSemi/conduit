@@ -45,7 +45,7 @@ const std = @import("std");
 // MMIO.
 const MockAperture = struct {
     sel: u8 = 0,
-    pending: [16]u32 = [_]u32{0} ** 16,
+    pending: [16]u32 = @splat(0),
 
     fn rd(ctx: ?*anyopaque, off: usize, width: Mmio.Width) u64 {
         _ = width;

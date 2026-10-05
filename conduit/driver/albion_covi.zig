@@ -37,7 +37,7 @@ pub const Covi = struct {
         self.mmio.write(u32, ARG_REALM, realm);
         self.mmio.write(u32, ARG_IRQ, irq);
         self.mmio.write(u32, CMD, op);
-        return @enumFromInt(@as(u4, @truncate(self.mmio.read(u32, RESULT))));
+        return @fromBackingInt(@as(u4, @truncate(self.mmio.read(u32, RESULT))));
     }
 
     /// Permit `irq` to be injected into `realm`.
@@ -73,7 +73,7 @@ const std = @import("std");
 const MockCovi = struct {
     arg_realm: u8 = 0,
     arg_irq: u32 = 0,
-    allow: [16]u32 = [_]u32{0} ** 16,
+    allow: [16]u32 = @splat(0),
     result: u32 = 0,
 
     fn rd(ctx: ?*anyopaque, off: usize, width: Mmio.Width) u64 {
