@@ -3,8 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const no_tests = b.option(bool, "no-tests", "skip building tests") orelse false;
-    const no_docs = b.option(bool, "no-docs", "skip installing documentation") orelse false;
+    const docs = b.option(bool, "docs", "install documentation") orelse true;
     const resource_cap = b.option(usize, "resource-cap", "max resources held inline per device node") orelse 8;
     const want_dtree = b.option(bool, "dtree", "build the device-tree backend") orelse true;
     const want_almanac = b.option(bool, "almanac", "build the ACPI (almanac) backend") orelse true;
@@ -34,47 +33,45 @@ pub fn build(b: *std.Build) void {
     if (dtree_dep) |d| conduit.addImport("dtree", d.module("dtree"));
     if (almanac_dep) |a| conduit.addImport("almanac", a.module("almanac"));
 
-    if (!no_tests) {
-        const step_test = b.step("test", "Run all unit tests");
+    const step_test = b.step("test", "Run all unit tests");
 
-        const unit_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("conduit.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conduit.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unit_tests.root_module.addOptions("build_options", options);
+    if (dtree_dep) |d| unit_tests.root_module.addImport("dtree", d.module("dtree"));
+    if (almanac_dep) |a| unit_tests.root_module.addImport("almanac", a.module("almanac"));
+
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    step_test.dependOn(&run_unit_tests.step);
+
+    // Integration tests drive conduit through its public module.
+    const integration_tests = b.addTest(.{
+        .name = "integration-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    integration_tests.root_module.addImport("conduit", conduit);
+    if (dtree_dep) |d| integration_tests.root_module.addImport("dtree", d.module("dtree"));
+    if (almanac_dep) |a| integration_tests.root_module.addImport("almanac", a.module("almanac"));
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    step_test.dependOn(&run_integration_tests.step);
+
+    if (docs) {
+        const install_docs = b.addInstallDirectory(.{
+            .source_dir = unit_tests.getEmittedDocs(),
+            .install_dir = .prefix,
+            .install_subdir = "docs",
         });
-        unit_tests.root_module.addOptions("build_options", options);
-        if (dtree_dep) |d| unit_tests.root_module.addImport("dtree", d.module("dtree"));
-        if (almanac_dep) |a| unit_tests.root_module.addImport("almanac", a.module("almanac"));
-
-        const run_unit_tests = b.addRunArtifact(unit_tests);
-        step_test.dependOn(&run_unit_tests.step);
-
-        // Integration tests drive conduit through its public module.
-        const integration_tests = b.addTest(.{
-            .name = "integration-test",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("test/root.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        integration_tests.root_module.addImport("conduit", conduit);
-        if (dtree_dep) |d| integration_tests.root_module.addImport("dtree", d.module("dtree"));
-        if (almanac_dep) |a| integration_tests.root_module.addImport("almanac", a.module("almanac"));
-
-        const run_integration_tests = b.addRunArtifact(integration_tests);
-        step_test.dependOn(&run_integration_tests.step);
-
-        if (!no_docs) {
-            const docs = b.addInstallDirectory(.{
-                .source_dir = unit_tests.getEmittedDocs(),
-                .install_dir = .prefix,
-                .install_subdir = "docs",
-            });
-            b.getInstallStep().dependOn(&docs.step);
-        }
+        b.getInstallStep().dependOn(&install_docs.step);
     }
 
     // The discovery example needs the device-tree backend.
