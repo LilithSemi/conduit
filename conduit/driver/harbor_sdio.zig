@@ -112,7 +112,9 @@ pub const HarborSdio = struct {
     const I_DATA_CRC: u32 = 0x08; // a received block failed CRC16
     const I_CMD_TIMEOUT: u32 = 0x10; // the card never drove a response
     const I_WRITE_ERR: u32 = 0x20; // the card rejected a written block
-    const I_ALL: u32 = 0x3f;
+    const I_RX_OVERRUN: u32 = 0x40; // a received word was dropped, RX FIFO full
+    const I_ADMA_ERR: u32 = 0x80; // the DMA engine faulted on memory
+    const I_ALL: u32 = 0xff;
 
     // CMD register: [5:0] index, [7:6] response type, [8] data present, [9] read
     // direction, [10] ADMA DMA. The controller uses the response-type bits to
@@ -183,6 +185,10 @@ pub const HarborSdio = struct {
     /// INT_STATUS first is what makes the timeout check below mean this command
     /// and not a previous one.
     fn cmdFlags(self: *HarborSdio, opcode: u32, arg: u32, resp: u32, flags: u32) ?[4]u32 {
+        // The controller ignores a CMD write while it is busy and does not
+        // report the drop, so a command sent too early would read back the
+        // previous one's response as its own. Wait for idle first.
+        if (!self.waitCmd()) return null;
         self.mmio.write(u32, INT_STATUS, I_ALL);
         self.mmio.write(u32, CMD_ARG, arg);
         self.mmio.write(u32, CMD, (opcode & 0x3f) | (resp << 6) | flags);
@@ -396,6 +402,10 @@ pub const HarborSdio = struct {
         const status = self.mmio.read(u32, INT_STATUS);
         if (status & I_DATA_DONE == 0) return false; // never finished
         if (status & I_DATA_CRC != 0) return false; // bad CRC16
+        // A dropped word leaves a hole in the buffer, so the block is wrong
+        // even though the card and the CRC were both fine.
+        if (status & I_RX_OVERRUN != 0) return false;
+        if (status & I_ADMA_ERR != 0) return false; // the engine never reached memory
         self.mmio.write(u32, INT_STATUS, I_ALL);
         return true;
     }
@@ -424,6 +434,8 @@ pub const HarborSdio = struct {
         _ = self.cmd(STOP_TRANSMISSION, 0, R_BUSY);
         if (status & I_DATA_DONE == 0) return false; // never finished
         if (status & I_DATA_CRC != 0) return false; // a block failed CRC16
+        if (status & I_RX_OVERRUN != 0) return false; // a dropped word, so a hole
+        if (status & I_ADMA_ERR != 0) return false; // the engine never reached memory
         return true;
     }
 
@@ -442,6 +454,10 @@ pub const HarborSdio = struct {
         const status = self.mmio.read(u32, INT_STATUS);
         if (status & I_DATA_DONE == 0) return false; // never finished
         if (status & I_WRITE_ERR != 0) return false; // card rejected the block
+        // A memory fault while the engine fed the card makes the controller
+        // send a bad CRC for every block left, so the card rejects them instead
+        // of programming zeros. The whole transfer is lost.
+        if (status & I_ADMA_ERR != 0) return false;
         self.mmio.write(u32, INT_STATUS, I_ALL);
         return true;
     }
@@ -594,6 +610,15 @@ const FakeHost = struct {
     width_set: u32 = 0,
     // Make one command time out, to check the driver reports the failure.
     timeout_cmd: ?u32 = null,
+    /// Drop a received word on every read, the way a full RX FIFO does.
+    overrun_on_read: bool = false,
+    /// Fault the DMA engine on every data phase, read or write.
+    adma_fault: bool = false,
+    /// Report busy for this many STATUS reads, counting down one per read. A
+    /// CMD write that arrives while busy is dropped, which is what the
+    /// controller does, and counted in `dropped_cmds`.
+    busy_reads: usize = 0,
+    dropped_cmds: usize = 0,
 
     fn descriptor(self: *FakeHost) struct { addr: u32, len: u32 } {
         // Direct single-buffer DMA (matches armDescriptor): ADMA_ADDR is the
@@ -614,6 +639,8 @@ const FakeHost = struct {
             @memcpy(self.media[0..n], buf[0..n]);
             self.writes += 1;
         }
+        if (read and self.overrun_on_read) self.int_status |= S.I_RX_OVERRUN;
+        if (self.adma_fault) self.int_status |= S.I_ADMA_ERR;
         self.int_status |= S.I_DATA_DONE;
     }
 
@@ -669,7 +696,13 @@ const FakeHost = struct {
         const self: *FakeHost = @ptrCast(@alignCast(ctx));
         return switch (off) {
             S.CTRL => self.ctrl,
-            S.STATUS => S.ST_CARD_DETECT, // card in the slot, never busy
+            S.STATUS => blk: {
+                if (self.busy_reads > 0) {
+                    self.busy_reads -= 1;
+                    break :blk S.ST_CARD_DETECT | S.ST_BUSY;
+                }
+                break :blk S.ST_CARD_DETECT; // card in the slot, idle
+            },
             S.CLK_DIV => self.clk_div,
             S.CMD_ARG => self.cmd_arg,
             S.RESP0 => self.resp[0],
@@ -692,7 +725,11 @@ const FakeHost = struct {
             S.CTRL => self.ctrl = v,
             S.CLK_DIV => self.clk_div = v,
             S.CMD_ARG => self.cmd_arg = v,
-            S.CMD => self.onCmd(v),
+            S.CMD => {
+                // The controller ignores a CMD write while busy, with nothing
+                // to say it happened.
+                if (self.busy_reads > 0) self.dropped_cmds += 1 else self.onCmd(v);
+            },
             S.BLK_SIZE => self.blk_size = v,
             S.BLK_COUNT => self.blk_count = v,
             S.INT_STATUS => self.int_status &= ~v, // write-1-to-clear
@@ -717,7 +754,12 @@ const FakeHost = struct {
 // low page and build the instance there, so the DMA path runs for real instead
 // of being rejected by the reach check. Returns null when the host cannot give
 // out that address, and the caller then skips.
+var low_instance: ?*HarborSdio = null;
+
 fn lowInstance() ?*HarborSdio {
+    // The fixed address takes one mapping per process, so later callers get the
+    // same instance back. Every test writes the whole struct before it runs.
+    if (low_instance) |p| return p;
     if (@sizeOf(usize) <= 4) return null; // any address already fits
     if (builtin.os.tag != .linux) return null;
     const size = (@sizeOf(HarborSdio) + 0xffff) & ~@as(usize, 0xffff);
@@ -733,7 +775,8 @@ fn lowInstance() ?*HarborSdio {
         std.posix.munmap(mem);
         return null;
     }
-    return @ptrCast(@alignCast(mem.ptr));
+    low_instance = @ptrCast(@alignCast(mem.ptr));
+    return low_instance;
 }
 
 test "harbor_sdio identifies an SDHC card, then reads and writes a block" {
@@ -847,4 +890,110 @@ test "harbor_sdio decodes a CSD v1 (SDSC) capacity" {
         0, // CSD_STRUCTURE = 0
     };
     try std.testing.expectEqual(@as(u64, 4059136), dev.readCapacity());
+}
+
+test "harbor_sdio fails a read whose received word was dropped" {
+    // A full RX FIFO drops a word and raises INT_STATUS[6]. The card answered
+    // and the CRC was good, so nothing else in the status says the buffer has a
+    // hole in it. A read that reported success here would hand the caller
+    // corrupt data.
+    var host = FakeHost{ .overrun_on_read = true };
+    for (&host.media, 0..) |*b, i| b.* = @truncate(i);
+
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
+}
+
+test "harbor_sdio still writes when the RX path reports no overrun" {
+    // The overrun bit belongs to the receive path, so a write is unaffected.
+    var host = FakeHost{ .overrun_on_read = true };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [512]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = @truncate(i ^ 0x5a);
+    try std.testing.expect(dev.block().writeBlocks(3, 1, &out));
+    try std.testing.expectEqualSlices(u8, &out, host.media[0..]);
+}
+
+test "harbor_sdio clears the overrun bit so it cannot fail a later read" {
+    // I_ALL has to cover the overrun bit. Left set, the sticky bit would fail
+    // every read after the first one.
+    var host = FakeHost{ .overrun_on_read = true };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
+
+    // The controller stops dropping words. The next read can only succeed if
+    // the driver's status clear covered the overrun bit, because the bit is
+    // sticky and nothing else clears it.
+    host.overrun_on_read = false;
+    try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
+}
+
+test "harbor_sdio waits for an idle controller before it writes CMD" {
+    // The controller ignores a CMD write while it is busy and reports nothing,
+    // so a driver that writes CMD first loses the command and then reads the
+    // previous one's response registers as if they answered it. Every command
+    // has to wait for idle before it goes out.
+    var host = FakeHost{ .busy_reads = 3 };
+    for (&host.media, 0..) |*b, i| b.* = @truncate(i);
+
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.high_capacity);
+    try std.testing.expectEqual(@as(usize, 0), host.dropped_cmds);
+
+    // A controller that goes busy again between transfers loses nothing either.
+    host.busy_reads = 5;
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
+    try std.testing.expectEqual(@as(usize, 0), host.dropped_cmds);
+    try std.testing.expectEqualSlices(u8, host.media[0..], buf[0..]);
+}
+
+test "harbor_sdio fails a read the DMA engine faulted on" {
+    // A memory fault during the data phase raises INT_STATUS[7]. The card and
+    // the CRC both look fine, so this bit is the only sign the buffer never got
+    // the data.
+    var host = FakeHost{ .adma_fault = true };
+    for (&host.media, 0..) |*b, i| b.* = @truncate(i);
+
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
+}
+
+test "harbor_sdio fails a write the DMA engine faulted on" {
+    // The engine reads memory to feed the card. A fault there makes the
+    // controller send a bad CRC for the rest of the command, so the card
+    // rejects those blocks. The transfer has to fail.
+    var host = FakeHost{ .adma_fault = true };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [512]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = @truncate(i ^ 0x3c);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+}
+
+test "harbor_sdio clears the DMA fault bit so it cannot fail a later transfer" {
+    // I_ALL has to cover bit 7. The bit is sticky, so one left set would fail
+    // every transfer after it.
+    var host = FakeHost{ .adma_fault = true };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
+
+    host.adma_fault = false;
+    try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
 }
