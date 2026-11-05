@@ -12,6 +12,14 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/almanac#70e5ea998a320c441cfd7b68c71d94888d246551",
             .hash = "almanac-0.1.0-9SzmcJ8pBgC05r2UQazhuVhCuMRbSS_zhnYSEJmrcqG4",
         },
+        .sifli_pac = .{
+            .url = "git+https://github.com/OpenSiFli/sifli-pac#bc148a3d953b745b923d1e88d7a2c65fa818b952",
+            .hash = "N-V-__8AAB5UEgFPJBzjUr6BBEJ9LyXZri_46CoEWgg5pch2",
+        },
+        .svd2zig = .{
+            .url = "/home/ross/LilithSemi/svd2zig",
+            .hash = "svd2zig-0.1.0-qJLFJrcm9hOjhIXC6qtAaFrhitnvQy50fi9NbLlhXvZ9",
+        },
     },
     .paths = .{"."},
 }

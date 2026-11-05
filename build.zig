@@ -1,4 +1,5 @@
 const std = @import("std");
+const svd2zig = @import("svd2zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -8,6 +9,20 @@ pub fn build(b: *std.Build) void {
     const want_dtree = b.option(bool, "dtree", "build the device-tree backend") orelse true;
     const want_almanac = b.option(bool, "almanac", "build the ACPI (almanac) backend") orelse true;
     const want_pci = b.option(bool, "pci", "build the PCI backend (/sys on Linux, EFI_PCI_IO on UEFI)") orelse true;
+
+    // These are intentionally eager dependencies. Besides avoiding Zig lazy
+    // dependency retries under Nix, this guarantees that every build uses the
+    // PAC generated from the SVD pinned in build.zig.zon.
+    const sifli_pac = b.dependency("sifli_pac", .{});
+    const svd2zig_dep = b.dependency("svd2zig", .{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const sf32lb52_regs = svd2zig.addGenerate(b, svd2zig_dep, .{
+        .svd = sifli_pac.path("svd/SF32LB52x.svd"),
+        .style = .consts,
+        .name = "sf32lb52_regs",
+    });
 
     const options = b.addOptions();
     options.addOption(usize, "resource_cap", resource_cap);
@@ -30,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     conduit.addOptions("build_options", options);
+    conduit.addImport("sf32lb52_regs", sf32lb52_regs);
     if (dtree_dep) |d| conduit.addImport("dtree", d.module("dtree"));
     if (almanac_dep) |a| conduit.addImport("almanac", a.module("almanac"));
 
@@ -43,6 +59,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addOptions("build_options", options);
+    unit_tests.root_module.addImport("sf32lb52_regs", sf32lb52_regs);
     if (dtree_dep) |d| unit_tests.root_module.addImport("dtree", d.module("dtree"));
     if (almanac_dep) |a| unit_tests.root_module.addImport("almanac", a.module("almanac"));
 

@@ -11,6 +11,9 @@
 //!
 //! See docs/superpowers/specs/2026-06-09-conduit-hal-design.md for the design.
 
+/// Register constants generated from the SF32LB52 SVD pinned by this package.
+pub const sf32lb52 = @import("sf32lb52_regs");
+
 pub const config = @import("conduit/config.zig");
 
 pub const dtree = if (config.have_dtree) @import("dtree") else struct {};
@@ -65,6 +68,10 @@ pub const device = struct {
     pub const Rtc = @import("conduit/device/rtc.zig");
     pub const Intc = @import("conduit/device/intc.zig");
     pub const Sd = @import("conduit/device/sd.zig");
+    pub const Watchdog = @import("conduit/device/watchdog.zig");
+    pub const Entropy = @import("conduit/device/entropy.zig");
+    pub const Temperature = @import("conduit/device/temperature.zig");
+    pub const Pwm = @import("conduit/device/pwm.zig");
 };
 
 /// Shipped driver implementations. Each exports `bind(Mmio, ...)`, and the
@@ -103,6 +110,26 @@ pub const driver = struct {
     pub const albion_ed25519_sign = @import("conduit/driver/albion_ed25519_sign.zig");
     pub const albion_rotkdf = @import("conduit/driver/albion_rotkdf.zig");
     pub const harbor_trng = @import("conduit/driver/harbor_trng.zig");
+    pub const sf32lb52_audio = @import("conduit/driver/sf32lb52_audio.zig");
+    pub const sf32lb52_dmac = @import("conduit/driver/sf32lb52_dmac.zig");
+    pub const sf32lb52_efuse = @import("conduit/driver/sf32lb52_efuse.zig");
+    pub const sf32lb52_gpio = @import("conduit/driver/sf32lb52_gpio.zig");
+    pub const sf32lb52_i2c = @import("conduit/driver/sf32lb52_i2c.zig");
+    pub const sf32lb52_lcdc = @import("conduit/driver/sf32lb52_lcdc.zig");
+    pub const sf32lb52_mpi = @import("conduit/driver/sf32lb52_mpi.zig");
+    pub const sf32lb52_pdm = @import("conduit/driver/sf32lb52_pdm.zig");
+    pub const sf32lb52_pmuc = @import("conduit/driver/sf32lb52_pmuc.zig");
+    pub const sf32lb52_rtc = @import("conduit/driver/sf32lb52_rtc.zig");
+    pub const sf32lb52_hpsys_rcc = @import("conduit/driver/sf32lb52_hpsys_rcc.zig");
+    pub const sf32lb52_hpsys_cfg = @import("conduit/driver/sf32lb52_hpsys_cfg.zig");
+    pub const sf32lb52_hpsys_aon = @import("conduit/driver/sf32lb52_hpsys_aon.zig");
+    pub const sf32lb52_pinmux = @import("conduit/driver/sf32lb52_pinmux.zig");
+    pub const sf32lb52_spi = @import("conduit/driver/sf32lb52_spi.zig");
+    pub const sf32lb52_trng = @import("conduit/driver/sf32lb52_trng.zig");
+    pub const sf32lb52_tsen = @import("conduit/driver/sf32lb52_tsen.zig");
+    pub const sf32lb52_timer = @import("conduit/driver/sf32lb52_timer.zig");
+    pub const sf32lb52_usart = @import("conduit/driver/sf32lb52_usart.zig");
+    pub const sf32lb52_wdt = @import("conduit/driver/sf32lb52_wdt.zig");
 };
 
 /// A matcher table covering every shipped driver. A consumer can pass this
@@ -132,15 +159,24 @@ test {
     _ = resource;
     _ = Mmio;
     _ = discover;
-    inline for (.{ device.Serial, device.Block, device.Gpio, device.I2c, device.Spi, device.Rtc, device.Intc, device.Sd }) |d| _ = d;
     inline for (.{
-        driver.ns16550a,    driver.pl011,              driver.harbor_gpio,         driver.harbor_i2c,
-        driver.harbor_spi,  driver.plic,               driver.clint,               driver.gicv2,
-        driver.gicv3,       driver.harbor_sdio,        driver.sd_spi,              driver.virtio_blk,
-        driver.virtio_gpu,  driver.goldfish_rtc,       driver.pl031,               driver.albion_ftpm,
-        driver.albion_pcr,  driver.harbor_trng,        driver.albion_ed25519,      driver.albion_integrity,
-        driver.albion_gpc,  driver.albion_rmm,         driver.albion_measure,      driver.albion_sealver,
-        driver.albion_covi, driver.albion_covi_inject, driver.albion_ed25519_sign, driver.albion_rotkdf,
+        device.Serial,   device.Block,   device.Gpio,        device.I2c,
+        device.Spi,      device.Rtc,     device.Intc,        device.Sd,
+        device.Watchdog, device.Entropy, device.Temperature, device.Pwm,
+    }) |d| _ = d;
+    inline for (.{
+        driver.ns16550a,           driver.pl011,              driver.harbor_gpio,         driver.harbor_i2c,
+        driver.harbor_spi,         driver.plic,               driver.clint,               driver.gicv2,
+        driver.gicv3,              driver.harbor_sdio,        driver.sd_spi,              driver.virtio_blk,
+        driver.virtio_gpu,         driver.goldfish_rtc,       driver.pl031,               driver.albion_ftpm,
+        driver.albion_pcr,         driver.harbor_trng,        driver.albion_ed25519,      driver.albion_integrity,
+        driver.albion_gpc,         driver.albion_rmm,         driver.albion_measure,      driver.albion_sealver,
+        driver.albion_covi,        driver.albion_covi_inject, driver.albion_ed25519_sign, driver.albion_rotkdf,
+        driver.sf32lb52_audio,     driver.sf32lb52_dmac,      driver.sf32lb52_efuse,      driver.sf32lb52_gpio,
+        driver.sf32lb52_i2c,       driver.sf32lb52_lcdc,      driver.sf32lb52_mpi,        driver.sf32lb52_hpsys_rcc,
+        driver.sf32lb52_hpsys_cfg, driver.sf32lb52_hpsys_aon, driver.sf32lb52_pdm,        driver.sf32lb52_pmuc,
+        driver.sf32lb52_rtc,       driver.sf32lb52_pinmux,    driver.sf32lb52_spi,        driver.sf32lb52_trng,
+        driver.sf32lb52_tsen,      driver.sf32lb52_timer,     driver.sf32lb52_usart,      driver.sf32lb52_wdt,
     }) |d| _ = d;
     if (config.have_dtree) _ = backend.dtree;
     if (config.have_almanac) _ = backend.almanac;
