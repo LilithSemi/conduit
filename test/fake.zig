@@ -85,6 +85,14 @@ pub const Sparse = struct {
         return null;
     }
 
+    /// Whether `val` was written to `off` at any point in the trace.
+    pub fn sawWrite(self: *const Sparse, off: usize, val: u64) bool {
+        for (self.writes[0..self.nw]) |entry| {
+            if (entry.off == off and entry.val == val) return true;
+        }
+        return false;
+    }
+
     /// Pin a read value at `off`, for example a GIC IAR or PLIC claim register.
     pub fn setRead(self: *Sparse, off: usize, val: u64) void {
         self.reads[self.nr] = .{ .off = off, .val = val };

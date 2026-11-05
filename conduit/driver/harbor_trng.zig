@@ -9,6 +9,7 @@
 //!   STATUS 0x08 (RO): bit0 = ready, bit1 = health-test failed
 
 const Mmio = @import("../mmio.zig");
+const Entropy = @import("../device/entropy.zig");
 
 pub const Trng = struct {
     mmio: Mmio,
@@ -31,8 +32,12 @@ pub const Trng = struct {
         return self.mmio.read(u32, RAND);
     }
 
-    /// Fill `out` with random bytes (little-endian word extraction).
-    pub fn fill(self: Trng, out: []u8) void {
+    /// Fill `out` with random bytes (little-endian word extraction). Refuse to
+    /// expose output before seeding or after a continuous health-test failure.
+    pub fn fill(self: Trng, out: []u8) Entropy.Error!void {
+        if (!self.healthy()) return error.HealthTestFailed;
+        if (!self.ready()) return error.NotReady;
+
         var i: usize = 0;
         while (i + 4 <= out.len) : (i += 4) {
             const w = self.next();
@@ -48,6 +53,10 @@ pub const Trng = struct {
                 w >>= 8;
             }
         }
+    }
+
+    pub fn entropy(self: *Trng) Entropy {
+        return Entropy.from(self);
     }
 };
 
