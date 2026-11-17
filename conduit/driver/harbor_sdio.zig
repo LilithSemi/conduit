@@ -120,12 +120,19 @@ pub const HarborSdio = struct {
     const I_WRITE_ERR: u32 = 0x20; // the card rejected a written block
     const I_RX_OVERRUN: u32 = 0x40; // a received word was dropped, RX FIFO full
     const I_ADMA_ERR: u32 = 0x80; // the DMA engine faulted on memory
-    const I_ALL: u32 = 0xff;
+    const I_DATA_TIMEOUT: u32 = 0x100; // a read block never started
+    const I_RESP_CRC: u32 = 0x200; // the response failed CRC7
+    const I_RESP_END: u32 = 0x400; // bad end bit or transmission bit
+    const I_RESP_INDEX: u32 = 0x800; // the response has another command index
+    // A response with one of these never sets I_CMD_DONE.
+    const I_CMD_ERRORS: u32 = I_CMD_TIMEOUT | I_RESP_CRC | I_RESP_END | I_RESP_INDEX;
+    const I_ALL: u32 = 0xfff;
 
     // CMD register: [5:0] index, [7:6] response type, [8] data present, [9] read
-    // direction, [10] ADMA DMA. The controller uses the response-type bits to
-    // decide whether (and how long) to capture the card's response. Without them
-    // it sends every command as no-response and never fills RESP0..3.
+    // direction, [10] ADMA DMA, [12] no CRC7 check, [13] no index check. The
+    // controller uses the response-type bits to decide whether (and how long)
+    // to capture the card's response. Without them it sends every command as
+    // no-response and never fills RESP0..3.
     const R_NONE = 0; // no response (CMD0)
     const R_SHORT = 1; // 48-bit R1/R3/R6/R7
     const R_LONG = 2; // 136-bit R2 (CID/CSD)
@@ -133,6 +140,9 @@ pub const HarborSdio = struct {
     const F_DATA = 1 << 8; // the command carries a data phase
     const F_READ = 1 << 9; // data direction card -> host (clear = host -> card)
     const F_DMA = 1 << 10; // stream the data phase through the ADMA engine
+    // An R3 response has no CRC7 and no command index, so the host must not
+    // check them.
+    const F_R3 = (1 << 12) | (1 << 13);
     const F_DATA_READ = F_DATA | F_READ;
     const F_DATA_WRITE = F_DATA;
 
@@ -196,7 +206,8 @@ pub const HarborSdio = struct {
     }
 
     /// Issue one command. Returns the four response words, or null when the
-    /// controller never went idle or the card never answered. Clearing
+    /// controller never went idle, the card never answered or the response
+    /// was bad. Clearing
     /// INT_STATUS first is what makes the timeout check below mean this command
     /// and not a previous one.
     fn cmdFlags(self: *HarborSdio, opcode: u32, arg: u32, resp: u32, flags: u32) ?[4]u32 {
@@ -208,7 +219,7 @@ pub const HarborSdio = struct {
         self.mmio.write(u32, CMD_ARG, arg);
         self.mmio.write(u32, CMD, (opcode & 0x3f) | (resp << 6) | flags);
         if (!self.waitCmd()) return null;
-        if (self.mmio.read(u32, INT_STATUS) & I_CMD_TIMEOUT != 0) return null;
+        if (self.mmio.read(u32, INT_STATUS) & I_CMD_ERRORS != 0) return null;
         return .{
             self.mmio.read(u32, RESP0),
             self.mmio.read(u32, RESP0 + 8),
@@ -266,7 +277,7 @@ pub const HarborSdio = struct {
         var ocr: u32 = 0;
         while (tries > 0) : (tries -= 1) {
             _ = self.cmd(APP_CMD, 0, R_SHORT) orelse return false;
-            const resp = self.cmd(SD_SEND_OP_COND, hcs | 0x00ff8000, R_SHORT) orelse return false;
+            const resp = self.cmdFlags(SD_SEND_OP_COND, hcs | 0x00ff8000, R_SHORT, F_R3) orelse return false;
             ocr = resp[0];
             if (ocr & 0x80000000 != 0) break;
         }
@@ -421,6 +432,7 @@ pub const HarborSdio = struct {
         // A dropped word leaves a hole in the buffer, so the block is wrong
         // even though the card and the CRC were both fine.
         if (status & I_RX_OVERRUN != 0) return false;
+        if (status & I_DATA_TIMEOUT != 0) return false;
         if (status & I_ADMA_ERR != 0) return false; // the engine never reached memory
         self.mmio.write(u32, INT_STATUS, I_ALL);
         return true;
@@ -456,6 +468,7 @@ pub const HarborSdio = struct {
         if (status & I_DATA_DONE == 0) return false; // never finished
         if (status & I_DATA_CRC != 0) return false; // a block failed CRC16
         if (status & I_RX_OVERRUN != 0) return false; // a dropped word, so a hole
+        if (status & I_DATA_TIMEOUT != 0) return false;
         if (status & I_ADMA_ERR != 0) return false; // the engine never reached memory
         return true;
     }
@@ -648,6 +661,8 @@ const FakeHost = struct {
     width_set: u32 = 0,
     // Make one command time out, to check the driver reports the failure.
     timeout_cmd: ?u32 = null,
+    /// Make the response to one command fail its CRC7, with no command done.
+    bad_crc_cmd: ?u32 = null,
     /// Drop a received word on every read, the way a full RX FIFO does.
     overrun_on_read: bool = false,
     /// Fault the DMA engine on every data phase, read or write.
@@ -701,6 +716,18 @@ const FakeHost = struct {
         const has_data = value & S.F_DATA != 0;
         const is_read = value & S.F_READ != 0;
         self.resp = .{ 0, 0, 0, 0 };
+
+        if (self.bad_crc_cmd) |c| if (c == index and !self.acmd) {
+            self.int_status |= S.I_RESP_CRC;
+            return;
+        };
+        // The OCR response fails the checks of the host unless the driver
+        // turns them off.
+        if (self.acmd and index == S.SD_SEND_OP_COND and value & S.F_R3 != S.F_R3) {
+            self.acmd = false;
+            self.int_status |= S.I_RESP_CRC | S.I_RESP_INDEX;
+            return;
+        }
         self.int_status |= S.I_CMD_DONE;
 
         if (self.timeout_cmd) |t| if (t == index and !self.acmd) {
@@ -1143,4 +1170,21 @@ test "harbor_sdio stops the card after a read command with no response" {
     try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
     try std.testing.expectEqual(@as(usize, 0), host.reads);
     try std.testing.expectEqual(@as(usize, 1), host.stops);
+}
+
+test "harbor_sdio fails a command when the response has a bad CRC7" {
+    var host = FakeHost{};
+    host.bad_crc_cmd = HarborSdio.SEND_REL_ADDR;
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(!dev.cardPresent());
+}
+
+test "harbor_sdio clears the response error bits before the next command" {
+    var host = FakeHost{};
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    host.int_status |= HarborSdio.I_RESP_CRC | HarborSdio.I_RESP_END | HarborSdio.I_RESP_INDEX;
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
 }
