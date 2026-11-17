@@ -72,6 +72,9 @@ pub const HarborSdio = struct {
     high_capacity: bool = false,
     num_blocks: u64 = 0,
     present: bool = false,
+    /// The number of status reads a written block has to become ready. A
+    /// card that needs more fails the write.
+    ready_polls: u32 = 100_000,
     // Card identity, captured from the ALL_SEND_CID R2 response at bring-up.
     cid: sd.Cid = .{ .raw = @splat(0) },
     // ADMA descriptor for one transfer: [buffer addr], [len[15:0] | end<<31].
@@ -101,9 +104,12 @@ pub const HarborSdio = struct {
     const ST_BUSY: u32 = 1 << 8;
     const ST_DATA_VALID: u32 = 1 << 9; // a block word is ready to pop from DATA
 
-    // CTRL[0] enable, CTRL[5:4] active bus width (0:1-bit, 1:4-bit, 2:8-bit).
+    // CTRL[0] enable, CTRL[5:4] active bus width (0:1-bit, 1:4-bit, 2:8-bit),
+    // CTRL[8] sample the card on the falling clock edge. The reset value of
+    // bit 8 is the choice of the board, so the driver keeps it.
     const CTRL_ENABLE: u32 = 1 << 0;
     const CTRL_WIDTH_SHIFT: u5 = 4;
+    const CTRL_SAMPLE_FALL: u32 = 1 << 8;
 
     // INT_STATUS bits (write-1-to-clear).
     const I_CMD_DONE: u32 = 0x01;
@@ -137,6 +143,7 @@ pub const HarborSdio = struct {
     const SEND_IF_COND = 8;
     const SEND_CSD = 9;
     const STOP_TRANSMISSION = 12; // CMD12, ends an open-ended multi-block read
+    const SEND_STATUS = 13; // CMD13, the card status as R1
     const SET_BLOCKLEN = 16;
     const READ_SINGLE = 17;
     const READ_MULTIPLE = 18; // CMD18, streams BLK_COUNT blocks in one transfer
@@ -144,6 +151,14 @@ pub const HarborSdio = struct {
     const SET_BUS_WIDTH = 6; // ACMD6, arg 2 = 4-bit
     const APP_CMD = 55;
     const SD_SEND_OP_COND = 41; // ACMD41
+
+    // Card status (R1). Bits 12:9 hold the state, and 4 is the transfer state.
+    // Bit 25 reports a locked card and is not an error.
+    const CS_READY_FOR_DATA: u32 = 1 << 8;
+    const CS_STATE_SHIFT: u5 = 9;
+    const CS_STATE_MASK: u32 = 0xf;
+    const CS_STATE_TRANSFER: u32 = 4;
+    const CS_ERRORS: u32 = 0xfdf8_0000;
 
     const BLOCK_LEN = 512;
     // Blocks per multi-block DMA transfer. One CMD18 + one ADMA descriptor + one
@@ -212,7 +227,8 @@ pub const HarborSdio = struct {
 
     fn setCtrl(self: *HarborSdio, width: BusWidth) void {
         const w: u32 = @backingInt(width);
-        self.mmio.write(u32, CTRL, CTRL_ENABLE | (w << CTRL_WIDTH_SHIFT));
+        const edge = self.mmio.read(u32, CTRL) & CTRL_SAMPLE_FALL;
+        self.mmio.write(u32, CTRL, edge | CTRL_ENABLE | (w << CTRL_WIDTH_SHIFT));
     }
 
     /// True while a card is in the slot, per the card-detect pin.
@@ -225,7 +241,7 @@ pub const HarborSdio = struct {
     /// instead of ACMD41 and does not report an RCA, so it needs its own path.
     pub fn init(self: *HarborSdio) bool {
         self.present = false;
-        self.mmio.write(u32, CTRL, CTRL_ENABLE); // power on, 1-bit
+        self.setCtrl(.one); // power on, 1-bit
         self.mmio.write(u32, INT_ENABLE, 0); // poll, do not raise the line
         self.mmio.write(u32, INT_STATUS, I_ALL);
         self.mmio.write(u32, BLK_SIZE, BLOCK_LEN);
@@ -426,7 +442,12 @@ pub const HarborSdio = struct {
         // cmdFlags blocks on STATUS busy, which the controller holds through the
         // whole multi-block data phase, so it returns only once ADMA has
         // streamed all n blocks out.
-        _ = self.cmdFlags(READ_MULTIPLE, card_addr, R_SHORT, F_DATA_READ | F_DMA) orelse return false;
+        _ = self.cmdFlags(READ_MULTIPLE, card_addr, R_SHORT, F_DATA_READ | F_DMA) orelse {
+            // The host saw no response, but the card can have started the
+            // read. Stop it, so that it does not stream into the next command.
+            _ = self.cmd(STOP_TRANSMISSION, 0, R_BUSY);
+            return false;
+        };
         const status = self.mmio.read(u32, INT_STATUS);
         self.mmio.write(u32, INT_STATUS, I_ALL);
         // End the open-ended read so the card stops streaming. R1b: the card
@@ -446,6 +467,7 @@ pub const HarborSdio = struct {
         // The payload is already in `bounce`, at offset 0 (see writeBlocksImpl).
         // Publish it before the engine fetches it, pointing the descriptor at the
         // bounce buffer's physical address.
+        memFence();
         const bounce_addr = phys32(&self.bounce) orelse return false;
         if (!self.armDescriptor(bounce_addr, 1)) return false;
 
@@ -459,7 +481,23 @@ pub const HarborSdio = struct {
         // of programming zeros. The whole transfer is lost.
         if (status & I_ADMA_ERR != 0) return false;
         self.mmio.write(u32, INT_STATUS, I_ALL);
-        return true;
+        return self.waitTransfer();
+    }
+
+    // Wait until the card is in the transfer state again and ready for data.
+    // The controller can report the end of a write before the card has
+    // programmed the block, and a card in the programming state does not take
+    // the next data command. A card that does not answer fails the wait.
+    fn waitTransfer(self: *HarborSdio) bool {
+        var polls = self.ready_polls;
+        while (polls > 0) : (polls -= 1) {
+            const resp = self.cmd(SEND_STATUS, self.rca << 16, R_SHORT) orelse return false;
+            const card = resp[0];
+            if (card & CS_ERRORS != 0) return false;
+            const state = (card >> CS_STATE_SHIFT) & CS_STATE_MASK;
+            if (state == CS_STATE_TRANSFER and card & CS_READY_FOR_DATA != 0) return true;
+        }
+        return false;
     }
 
     /// Convert a logical block address to the card's addressing (block for
@@ -619,6 +657,18 @@ const FakeHost = struct {
     /// controller does, and counted in `dropped_cmds`.
     busy_reads: usize = 0,
     dropped_cmds: usize = 0,
+    /// After each write, the card reports the programming state for this many
+    /// status reads.
+    program_polls: u32 = 0,
+    program_left: u32 = 0,
+    /// The card answers no command after its first write.
+    silent_after_write: bool = false,
+    /// Error bits that the card puts in its status.
+    status_errors: u32 = 0,
+    status_polls: usize = 0,
+    stops: usize = 0,
+    /// A write that came while the card was programming an earlier block.
+    writes_while_programming: usize = 0,
 
     fn descriptor(self: *FakeHost) struct { addr: u32, len: u32 } {
         // Direct single-buffer DMA (matches armDescriptor): ADMA_ADDR is the
@@ -636,6 +686,8 @@ const FakeHost = struct {
             @memcpy(buf[0..n], self.media[0..n]);
             self.reads += 1;
         } else {
+            if (self.program_left > 0) self.writes_while_programming += 1;
+            self.program_left = self.program_polls;
             @memcpy(self.media[0..n], buf[0..n]);
             self.writes += 1;
         }
@@ -656,6 +708,11 @@ const FakeHost = struct {
             self.acmd = false;
             return;
         };
+
+        if (self.silent_after_write and self.writes > 0) {
+            self.int_status |= S.I_CMD_TIMEOUT;
+            return;
+        }
 
         const app = self.acmd;
         self.acmd = false;
@@ -681,6 +738,17 @@ const FakeHost = struct {
             S.SEND_REL_ADDR => self.resp[0] = 0x4567 << 16,
             S.SEND_CSD => self.resp = self.csd,
             S.ALL_SEND_CID => self.resp = self.cid,
+            S.STOP_TRANSMISSION => self.stops += 1,
+            S.SEND_STATUS => {
+                self.status_polls += 1;
+                // State 7 is programming, with the ready bit clear.
+                if (self.program_left > 0) {
+                    self.program_left -= 1;
+                    self.resp[0] = self.status_errors | (7 << S.CS_STATE_SHIFT);
+                } else {
+                    self.resp[0] = self.status_errors | (S.CS_STATE_TRANSFER << S.CS_STATE_SHIFT) | S.CS_READY_FOR_DATA;
+                }
+            },
             else => {},
         }
         if (has_data) {
@@ -996,4 +1064,83 @@ test "harbor_sdio clears the DMA fault bit so it cannot fail a later transfer" {
 
     host.adma_fault = false;
     try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
+}
+
+test "harbor_sdio keeps the sample edge that the board selected" {
+    var host = FakeHost{ .ctrl = HarborSdio.CTRL_SAMPLE_FALL };
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expectEqual(
+        HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE | (@as(u32, 1) << 4),
+        host.ctrl,
+    );
+
+    var narrow = FakeHost{ .ctrl = HarborSdio.CTRL_SAMPLE_FALL };
+    dev = bind(narrow.mmio(), .{ .freq = 50_000_000, .bus_width = .one });
+    try std.testing.expectEqual(HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE, narrow.ctrl);
+}
+
+test "harbor_sdio waits for the card to finish a block before it writes the next" {
+    // The controller reports the end of the data phase at once. A driver that
+    // trusts it sends the second block to a card that still programs the first.
+    var host = FakeHost{ .program_polls = 3 };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [1024]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try std.testing.expect(dev.block().writeBlocks(3, 2, &out));
+    try std.testing.expectEqual(@as(usize, 2), host.writes);
+    try std.testing.expectEqual(@as(usize, 0), host.writes_while_programming);
+    // Each block takes three busy answers and one ready answer.
+    try std.testing.expectEqual(@as(usize, 8), host.status_polls);
+    try std.testing.expectEqualSlices(u8, out[512..], host.media[0..]);
+}
+
+test "harbor_sdio fails a write when the card stops answering after the data" {
+    var host = FakeHost{ .silent_after_write = true };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [1024]u8 = @splat(0x11);
+    try std.testing.expect(!dev.block().writeBlocks(3, 2, &out));
+    // The second block does not go out.
+    try std.testing.expectEqual(@as(usize, 1), host.writes);
+}
+
+test "harbor_sdio fails a write when the card stays in the programming state" {
+    var host = FakeHost{ .program_polls = 1000 };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+    dev.ready_polls = 20;
+
+    var out: [512]u8 = @splat(0x22);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+    try std.testing.expectEqual(@as(usize, 20), host.status_polls);
+}
+
+test "harbor_sdio fails a write when the card status has an error bit" {
+    // Bit 26 is a write protect violation.
+    var host = FakeHost{ .status_errors = 1 << 26 };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [512]u8 = @splat(0x33);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+
+    // Bit 25 only says that the card is locked.
+    host.status_errors = 1 << 25;
+    try std.testing.expect(dev.block().writeBlocks(3, 1, &out));
+}
+
+test "harbor_sdio stops the card after a read command with no response" {
+    var host = FakeHost{};
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    host.timeout_cmd = HarborSdio.READ_MULTIPLE;
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(!dev.block().readBlocks(7, 1, &buf));
+    try std.testing.expectEqual(@as(usize, 0), host.reads);
+    try std.testing.expectEqual(@as(usize, 1), host.stops);
 }
