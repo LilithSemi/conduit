@@ -17,8 +17,8 @@
             .hash = "N-V-__8AAB5UEgFPJBzjUr6BBEJ9LyXZri_46CoEWgg5pch2",
         },
         .svd2zig = .{
-            .url = "/home/ross/LilithSemi/svd2zig",
-            .hash = "svd2zig-0.1.0-qJLFJrcm9hOjhIXC6qtAaFrhitnvQy50fi9NbLlhXvZ9",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/svd2zig#7b2cd355e65f6a250516168446a570b4fdd654a1",
+            .hash = "svd2zig-0.1.0-qJLFJhSoAQDezW4g5ndxSjHrrYQB_BsUb9XJr26bbTp6",
         },
     },
     .paths = .{"."},
