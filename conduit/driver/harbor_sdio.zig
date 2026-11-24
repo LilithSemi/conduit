@@ -90,6 +90,9 @@ pub const HarborSdio = struct {
     max_hz: u32 = 0,
     /// The card runs in High Speed mode.
     in_high_speed: bool = false,
+    /// The SD clock that the divider gives, in Hz. 0 when the input clock is
+    /// not known.
+    clock_hz: u32 = 0,
     // The card supports CMD6, command class 10 in the CSD.
     switch_class: bool = false,
     rca: u32 = 0,
@@ -278,7 +281,8 @@ pub const HarborSdio = struct {
     fn setClock(self: *HarborSdio, hz: u32) void {
         if (hz == 0 or self.clk_freq == 0) return;
         const half = std.math.divCeil(u32, self.clk_freq, 2 * hz) catch unreachable;
-        self.mmio.write(u32, CLK_DIV, if (half > 0) half - 1 else 0);
+        self.mmio.write(u32, CLK_DIV, half - 1);
+        self.clock_hz = self.clk_freq / (2 * half);
     }
 
     fn setCtrl(self: *HarborSdio, width: BusWidth) void {
@@ -1163,6 +1167,7 @@ test "harbor_sdio derives the SD clock divider from the input clock" {
     dev.clk_freq = 50_000_000;
     dev.setClock(400_000);
     try std.testing.expectEqual(@as(u32, 62), host.clk_div);
+    try std.testing.expectEqual(@as(u32, 396_825), dev.clock_hz);
 }
 
 test "harbor_sdio decodes a CSD v1 (SDSC) capacity" {
@@ -1491,6 +1496,7 @@ test "harbor_sdio switches a card to High Speed and doubles the clock" {
     try std.testing.expectEqual(@as(usize, 2), host.switch_cmds);
     // 100 MHz / (2 * 50 MHz) - 1 = 0.
     try std.testing.expectEqual(@as(u32, 0), host.clk_div);
+    try std.testing.expectEqual(@as(u32, 50_000_000), dev.clock_hz);
     // The block size is back at 512 for the reads.
     var buf: [512]u8 = undefined;
     try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
@@ -1525,4 +1531,5 @@ test "harbor_sdio limits the clock to the maximum of the board" {
     try std.testing.expect(dev.in_high_speed);
     // 40 MHz is not a rate of the divider, so the next lower rate, 25 MHz.
     try std.testing.expectEqual(@as(u32, 1), host.clk_div);
+    try std.testing.expectEqual(@as(u32, 25_000_000), dev.clock_hz);
 }
