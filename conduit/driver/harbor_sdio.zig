@@ -255,10 +255,11 @@ pub const HarborSdio = struct {
     }
 
     /// Program the SD clock. The controller halves the input clock once more
-    /// (CLK_DIV counts full periods), so the divider is freq/(2*hz) - 1.
+    /// (CLK_DIV counts full periods), so the divider is freq/(2*hz) - 1. The
+    /// division rounds up, so the clock is never faster than `hz`.
     fn setClock(self: *HarborSdio, hz: u32) void {
         if (hz == 0 or self.clk_freq == 0) return;
-        const half = self.clk_freq / (2 * hz);
+        const half = std.math.divCeil(u32, self.clk_freq, 2 * hz) catch unreachable;
         self.mmio.write(u32, CLK_DIV, if (half > 0) half - 1 else 0);
     }
 
@@ -1087,6 +1088,10 @@ test "harbor_sdio derives the SD clock divider from the input clock" {
     // A rate at or above half the input clock cannot divide further.
     dev.setClock(100_000_000);
     try std.testing.expectEqual(@as(u32, 0), host.clk_div);
+    // 62.5 MHz is not a rate of the divider, so the next lower rate.
+    dev.clk_freq = 50_000_000;
+    dev.setClock(400_000);
+    try std.testing.expectEqual(@as(u32, 62), host.clk_div);
 }
 
 test "harbor_sdio decodes a CSD v1 (SDSC) capacity" {
