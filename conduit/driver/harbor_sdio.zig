@@ -63,6 +63,15 @@ pub const Options = struct {
     data_hz: u32 = 25_000_000,
 };
 
+/// What the host and the card reported when a write failed.
+pub const Fault = struct {
+    /// INT_STATUS of the host at the failure.
+    int_status: u32 = 0,
+    /// The card status (R1) from CMD13 after the failure. Null when the card
+    /// did not answer.
+    card_status: ?u32 = null,
+};
+
 pub const HarborSdio = struct {
     mmio: Mmio,
     clk_freq: u32 = 0,
@@ -75,6 +84,10 @@ pub const HarborSdio = struct {
     /// The number of status reads a written block has to become ready. A
     /// card that needs more fails the write.
     ready_polls: u32 = 100_000,
+    /// The cause of the last failed write. Zero when no write failed.
+    fault: Fault = .{},
+    // The last card status that the wait for the transfer state read.
+    last_status: ?u32 = null,
     // Card identity, captured from the ALL_SEND_CID R2 response at bring-up.
     cid: sd.Cid = .{ .raw = @splat(0) },
     // ADMA descriptor for one transfer: [buffer addr], [len[15:0] | end<<31].
@@ -168,6 +181,8 @@ pub const HarborSdio = struct {
     const CS_STATE_SHIFT: u5 = 9;
     const CS_STATE_MASK: u32 = 0xf;
     const CS_STATE_TRANSFER: u32 = 4;
+    const CS_STATE_RECEIVE: u32 = 6;
+    const CS_STATE_PROGRAM: u32 = 7;
     const CS_ERRORS: u32 = 0xfdf8_0000;
 
     const BLOCK_LEN = 512;
@@ -301,16 +316,26 @@ pub const HarborSdio = struct {
         // sets the controller lanes to match. Both sides must agree or the
         // receive engine samples the wrong lanes. eMMC 8-bit uses CMD6 (SWITCH),
         // not ACMD6, so only the 4-bit widening is done here.
-        if (self.bus_width == .four) {
-            _ = self.cmd(APP_CMD, self.rca << 16, R_SHORT) orelse return false;
-            _ = self.cmd(SET_BUS_WIDTH, 2, R_SHORT) orelse return false;
-            self.setCtrl(.four);
-        } else {
-            self.setCtrl(.one);
-        }
+        // A card or a host that refuses ACMD6 stays at 1 bit, which every SD
+        // card supports.
+        //
+        // Do not send ACMD42 with an argument of 0. It turns off the pull-up
+        // of the card on CD/DAT3, and the host does not keep DAT3 high at the
+        // next CMD0. If ACMD42 is necessary, send it with 1 before a new init
+        // without a power cycle.
+        var width: BusWidth = .one;
+        if (self.bus_width == .four and self.setCardWidth()) width = .four;
+        self.bus_width = width;
+        self.setCtrl(width);
 
         self.setClock(self.data_hz);
         self.present = true;
+        return true;
+    }
+
+    fn setCardWidth(self: *HarborSdio) bool {
+        _ = self.cmd(APP_CMD, self.rca << 16, R_SHORT) orelse return false;
+        _ = self.cmd(SET_BUS_WIDTH, 2, R_SHORT) orelse return false;
         return true;
     }
 
@@ -484,17 +509,39 @@ pub const HarborSdio = struct {
         const bounce_addr = phys32(&self.bounce) orelse return false;
         if (!self.armDescriptor(bounce_addr, 1)) return false;
 
-        _ = self.cmdFlags(WRITE_SINGLE, addr, R_SHORT, F_DATA_WRITE | F_DMA) orelse return false;
+        if (self.cmdFlags(WRITE_SINGLE, addr, R_SHORT, F_DATA_WRITE | F_DMA) == null) return self.writeFailed();
 
         const status = self.mmio.read(u32, INT_STATUS);
-        if (status & I_DATA_DONE == 0) return false; // never finished
-        if (status & I_WRITE_ERR != 0) return false; // card rejected the block
+        if (status & I_DATA_DONE == 0) return self.writeFailed(); // never finished
+        if (status & I_WRITE_ERR != 0) return self.writeFailed(); // card rejected the block
         // A memory fault while the engine fed the card makes the controller
         // send a bad CRC for every block left, so the card rejects them instead
         // of programming zeros. The whole transfer is lost.
-        if (status & I_ADMA_ERR != 0) return false;
+        if (status & I_ADMA_ERR != 0) return self.writeFailed();
         self.mmio.write(u32, INT_STATUS, I_ALL);
-        return self.waitTransfer();
+        if (!self.waitTransfer()) {
+            self.fault = .{ .int_status = status, .card_status = self.last_status };
+            return false;
+        }
+        return true;
+    }
+
+    // Keeps the cause of a failed write, then brings the card back to the
+    // transfer state, so the next command and a later CMD0 find DAT0 high. A
+    // card that still receives data gets CMD12. A card that programs gets
+    // time to finish. It always gives false.
+    fn writeFailed(self: *HarborSdio) bool {
+        self.fault = .{ .int_status = self.mmio.read(u32, INT_STATUS) };
+        const first = self.cmd(SEND_STATUS, self.rca << 16, R_SHORT) orelse return false;
+        self.fault.card_status = first[0];
+        if ((first[0] >> CS_STATE_SHIFT) & CS_STATE_MASK == CS_STATE_RECEIVE)
+            _ = self.cmd(STOP_TRANSMISSION, 0, R_BUSY);
+        var polls = self.ready_polls;
+        while (polls > 0) : (polls -= 1) {
+            const resp = self.cmd(SEND_STATUS, self.rca << 16, R_SHORT) orelse return false;
+            if ((resp[0] >> CS_STATE_SHIFT) & CS_STATE_MASK != CS_STATE_PROGRAM) return false;
+        }
+        return false;
     }
 
     // Wait until the card is in the transfer state again and ready for data.
@@ -504,8 +551,10 @@ pub const HarborSdio = struct {
     fn waitTransfer(self: *HarborSdio) bool {
         var polls = self.ready_polls;
         while (polls > 0) : (polls -= 1) {
+            self.last_status = null;
             const resp = self.cmd(SEND_STATUS, self.rca << 16, R_SHORT) orelse return false;
             const card = resp[0];
+            self.last_status = card;
             if (card & CS_ERRORS != 0) return false;
             const state = (card >> CS_STATE_SHIFT) & CS_STATE_MASK;
             if (state == CS_STATE_TRANSFER and card & CS_READY_FOR_DATA != 0) return true;
@@ -577,6 +626,7 @@ pub const HarborSdio = struct {
 
     fn writeBlocksImpl(ctx: ?*anyopaque, lba: u64, count: u32, buf: [*]const u8) bool {
         const self: *HarborSdio = @ptrCast(@alignCast(ctx));
+        self.fault = .{};
         if (!self.present) return false;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
@@ -659,6 +709,12 @@ const FakeHost = struct {
     writes: usize = 0,
     last_addr: u32 = 0,
     width_set: u32 = 0,
+    /// The card refuses ACMD6.
+    refuse_width: bool = false,
+    /// The card rejects each written block and stays in this state until
+    /// CMD12.
+    reject_writes: ?u32 = null,
+    stuck_state: ?u32 = null,
     // Make one command time out, to check the driver reports the failure.
     timeout_cmd: ?u32 = null,
     /// Make the response to one command fail its CRC7, with no command done.
@@ -708,6 +764,10 @@ const FakeHost = struct {
         }
         if (read and self.overrun_on_read) self.int_status |= S.I_RX_OVERRUN;
         if (self.adma_fault) self.int_status |= S.I_ADMA_ERR;
+        if (!read) if (self.reject_writes) |state| {
+            self.int_status |= S.I_WRITE_ERR;
+            self.stuck_state = state;
+        };
         self.int_status |= S.I_DATA_DONE;
     }
 
@@ -753,7 +813,11 @@ const FakeHost = struct {
                         self.resp[0] = 0xc0ff8000; // ready | CCS (high capacity)
                     }
                 },
-                S.SET_BUS_WIDTH => self.width_set = self.cmd_arg,
+                S.SET_BUS_WIDTH => if (self.refuse_width) {
+                    self.int_status |= S.I_CMD_TIMEOUT;
+                } else {
+                    self.width_set = self.cmd_arg;
+                },
                 else => {},
             }
             return;
@@ -765,11 +829,16 @@ const FakeHost = struct {
             S.SEND_REL_ADDR => self.resp[0] = 0x4567 << 16,
             S.SEND_CSD => self.resp = self.csd,
             S.ALL_SEND_CID => self.resp = self.cid,
-            S.STOP_TRANSMISSION => self.stops += 1,
+            S.STOP_TRANSMISSION => {
+                self.stops += 1;
+                self.stuck_state = null;
+            },
             S.SEND_STATUS => {
                 self.status_polls += 1;
                 // State 7 is programming, with the ready bit clear.
-                if (self.program_left > 0) {
+                if (self.stuck_state) |state| {
+                    self.resp[0] = self.status_errors | (state << S.CS_STATE_SHIFT);
+                } else if (self.program_left > 0) {
                     self.program_left -= 1;
                     self.resp[0] = self.status_errors | (7 << S.CS_STATE_SHIFT);
                 } else {
@@ -1187,4 +1256,57 @@ test "harbor_sdio clears the response error bits before the next command" {
     host.int_status |= HarborSdio.I_RESP_CRC | HarborSdio.I_RESP_END | HarborSdio.I_RESP_INDEX;
     var buf: [512]u8 = undefined;
     try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
+}
+
+test "harbor_sdio stays at 1 bit when the card refuses ACMD6" {
+    var host = FakeHost{ .refuse_width = true };
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expectEqual(BusWidth.one, dev.bus_width);
+    try std.testing.expectEqual(HarborSdio.CTRL_ENABLE, host.ctrl);
+}
+
+test "harbor_sdio stops a card that rejected a block and keeps the cause" {
+    const S = HarborSdio;
+    var host = FakeHost{ .reject_writes = S.CS_STATE_RECEIVE };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+
+    var out: [1024]u8 = @splat(0x44);
+    try std.testing.expect(!dev.block().writeBlocks(3, 2, &out));
+    try std.testing.expectEqual(@as(usize, 1), host.writes);
+    try std.testing.expectEqual(@as(usize, 1), host.stops);
+    try std.testing.expect(dev.fault.int_status & S.I_WRITE_ERR != 0);
+    try std.testing.expectEqual(@as(?u32, S.CS_STATE_RECEIVE << S.CS_STATE_SHIFT), dev.fault.card_status);
+
+    // The card is in the transfer state again, and the next write clears the
+    // record.
+    host.reject_writes = null;
+    try std.testing.expect(dev.block().writeBlocks(3, 1, &out));
+    try std.testing.expectEqual(@as(u32, 0), dev.fault.int_status);
+}
+
+test "harbor_sdio waits for a card that programs after a rejected block" {
+    const S = HarborSdio;
+    var host = FakeHost{ .reject_writes = S.CS_STATE_PROGRAM };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+    dev.ready_polls = 5;
+
+    var out: [512]u8 = @splat(0x55);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+    try std.testing.expectEqual(@as(usize, 0), host.stops);
+    // One status read for the record, then the wait.
+    try std.testing.expectEqual(@as(usize, 6), host.status_polls);
+}
+
+test "harbor_sdio keeps the last card status when the card stays busy" {
+    var host = FakeHost{ .program_polls = 1000 };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000 });
+    dev.ready_polls = 3;
+
+    var out: [512]u8 = @splat(0x66);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+    try std.testing.expectEqual(@as(?u32, 7 << HarborSdio.CS_STATE_SHIFT), dev.fault.card_status);
 }
