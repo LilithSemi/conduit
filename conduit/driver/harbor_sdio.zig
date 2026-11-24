@@ -64,6 +64,11 @@ pub const Options = struct {
     /// A clock in microseconds. With it, the wait for DAT0 before CMD0 has a
     /// limit of 500 ms. Without it, the limit is a count of register reads.
     now_us: ?*const fn () u64 = null,
+    /// Switch a card that supports it to High Speed after identification,
+    /// with CMD6, and run the data clock at up to 50 MHz.
+    high_speed: bool = false,
+    /// The highest SD clock that the board wiring supports. 0 sets no limit.
+    max_hz: u32 = 0,
 };
 
 /// What the host and the card reported when a write failed.
@@ -81,6 +86,12 @@ pub const HarborSdio = struct {
     bus_width: BusWidth = .four,
     data_hz: u32 = 25_000_000,
     now_us: ?*const fn () u64 = null,
+    high_speed: bool = false,
+    max_hz: u32 = 0,
+    /// The card runs in High Speed mode.
+    in_high_speed: bool = false,
+    // The card supports CMD6, command class 10 in the CSD.
+    switch_class: bool = false,
     rca: u32 = 0,
     high_capacity: bool = false,
     num_blocks: u64 = 0,
@@ -183,6 +194,13 @@ pub const HarborSdio = struct {
     const READ_MULTIPLE = 18; // CMD18, streams BLK_COUNT blocks in one transfer
     const WRITE_SINGLE = 24;
     const SET_BUS_WIDTH = 6; // ACMD6, arg 2 = 4-bit
+    const SWITCH_FUNC = 6; // CMD6, with a 64 byte status on DAT
+    const HIGH_SPEED_HZ = 50_000_000;
+    // Mode 0 checks and mode 1 sets function 1 of group 1 (High Speed). The
+    // other groups keep their function (0xf).
+    const SWITCH_CHECK_HS: u32 = 0x00ff_fff1;
+    const SWITCH_SET_HS: u32 = 0x80ff_fff1;
+    const SWITCH_STATUS_LEN = 64;
     const APP_CMD = 55;
     const SD_SEND_OP_COND = 41; // ACMD41
 
@@ -343,7 +361,11 @@ pub const HarborSdio = struct {
         self.bus_width = width;
         self.setCtrl(width);
 
-        self.setClock(self.data_hz);
+        var hz = self.data_hz;
+        self.in_high_speed = self.high_speed and self.switch_class and self.switchHighSpeed();
+        if (self.in_high_speed) hz = HIGH_SPEED_HZ;
+        if (self.max_hz != 0) hz = @min(hz, self.max_hz);
+        self.setClock(hz);
         self.present = true;
         return true;
     }
@@ -367,6 +389,31 @@ pub const HarborSdio = struct {
         return false;
     }
 
+    // CMD6 in mode 0, then in mode 1. Each gives a 64 byte status, with the
+    // bits of group 1 in bytes 12 and 13 (support) and the low half of byte
+    // 16 (the function that the card can set, or did set).
+    fn switchHighSpeed(self: *HarborSdio) bool {
+        const check = self.switchStatus(SWITCH_CHECK_HS) orelse return false;
+        if (check[13] & 0x02 == 0 or check[16] & 0x0f != 1) return false;
+        const set = self.switchStatus(SWITCH_SET_HS) orelse return false;
+        return set[16] & 0x0f == 1;
+    }
+
+    fn switchStatus(self: *HarborSdio, arg: u32) ?*const [SWITCH_STATUS_LEN]u8 {
+        const dst = phys32(&self.bounce) orelse return null;
+        self.mmio.write(u32, ADMA_ADDR, dst);
+        self.mmio.write(u32, BLK_SIZE, SWITCH_STATUS_LEN);
+        self.mmio.write(u32, BLK_COUNT, 1);
+        defer self.mmio.write(u32, BLK_SIZE, BLOCK_LEN);
+        _ = self.cmdFlags(SWITCH_FUNC, arg, R_SHORT, F_DATA_READ | F_DMA) orelse return null;
+        const status = self.mmio.read(u32, INT_STATUS);
+        if (status & I_DATA_DONE == 0) return null;
+        if (status & (I_DATA_CRC | I_RX_OVERRUN | I_DATA_TIMEOUT | I_ADMA_ERR) != 0) return null;
+        self.mmio.write(u32, INT_STATUS, I_ALL);
+        cacheFlush();
+        return self.bounce[0..SWITCH_STATUS_LEN];
+    }
+
     fn setCardWidth(self: *HarborSdio) bool {
         _ = self.cmd(APP_CMD, self.rca << 16, R_SHORT) orelse return false;
         _ = self.cmd(SET_BUS_WIDTH, 2, R_SHORT) orelse return false;
@@ -385,6 +432,8 @@ pub const HarborSdio = struct {
     /// is CSD[127:126], the top 2 bits of resp[3].
     fn readCapacity(self: *HarborSdio) u64 {
         const csd = self.cmd(SEND_CSD, self.rca << 16, R_LONG) orelse return 0;
+        // CCC is CSD[95:84], and class 10 (CMD6) is CSD[94].
+        self.switch_class = csd[2] & (1 << 30) != 0;
         const csd_structure = (csd[3] >> 30) & 0x3;
         if (csd_structure == 1) {
             // CSD v2 (SDHC/SDXC): C_SIZE is CSD[69:48].
@@ -703,6 +752,8 @@ pub fn bind(mmio: Mmio, opts: Options) HarborSdio {
         .bus_width = opts.bus_width,
         .data_hz = opts.data_hz,
         .now_us = opts.now_us,
+        .high_speed = opts.high_speed,
+        .max_hz = opts.max_hz,
     };
     _ = dev.init();
     return dev;
@@ -748,6 +799,13 @@ const FakeHost = struct {
     /// as on a host older than the register.
     dat0_low_reads: ?u32 = 0,
     diag_reads: usize = 0,
+    /// The card supports High Speed through CMD6.
+    high_speed: bool = false,
+    /// The card switched to High Speed.
+    switched: bool = false,
+    switch_cmds: usize = 0,
+    // The data of the next read, in place of the media.
+    status_data: ?[64]u8 = null,
     /// The card refuses ACMD6.
     refuse_width: bool = false,
     /// The card rejects each written block and stays in this state until
@@ -793,7 +851,12 @@ const FakeHost = struct {
         const buf: [*]u8 = @ptrFromInt(d.addr);
         const n = @min(d.len, self.media.len);
         if (read) {
-            @memcpy(buf[0..n], self.media[0..n]);
+            if (self.status_data) |status| {
+                @memcpy(buf[0..@min(d.len, status.len)], status[0..@min(d.len, status.len)]);
+                self.status_data = null;
+            } else {
+                @memcpy(buf[0..n], self.media[0..n]);
+            }
             self.reads += 1;
         } else {
             if (self.program_left > 0) self.writes_while_programming += 1;
@@ -867,6 +930,14 @@ const FakeHost = struct {
             S.SEND_IF_COND => self.resp[0] = 0x1aa, // v2, pattern echoed
             S.SEND_REL_ADDR => self.resp[0] = 0x4567 << 16,
             S.SEND_CSD => self.resp = self.csd,
+            S.SWITCH_FUNC => {
+                self.switch_cmds += 1;
+                var status: [64]u8 = @splat(0);
+                if (self.high_speed) status[13] = 0x03;
+                status[16] = if (self.high_speed) 0x01 else 0x0f;
+                if (self.high_speed and self.cmd_arg >> 31 == 1) self.switched = true;
+                self.status_data = status;
+            },
             S.ALL_SEND_CID => self.resp = self.cid,
             S.STOP_TRANSMISSION => {
                 self.stops += 1;
@@ -1392,4 +1463,66 @@ test "harbor_sdio limits the wait for DAT0 by time when it has a clock" {
     try std.testing.expect(dev.cardPresent());
     // Each clock read moves 1 ms, so 500 ms is 500 reads after the start.
     try std.testing.expectEqual(@as(usize, 500), host.diag_reads);
+}
+
+// Builds the driver in the low instance and runs init there, so the status
+// of CMD6 can go to its bounce buffer over DMA.
+fn initLow(host: *FakeHost, opts: Options) ?*HarborSdio {
+    const dev = lowInstance() orelse return null;
+    dev.* = .{
+        .mmio = host.mmio(),
+        .clk_freq = opts.freq,
+        .high_speed = opts.high_speed,
+        .max_hz = opts.max_hz,
+    };
+    _ = dev.init();
+    return dev;
+}
+
+// The default CSD with command class 10 (CMD6) set.
+const csd_with_switch: [4]u32 = .{ 0, 0x1fff0000, 1 << 30, 0x40000000 };
+
+test "harbor_sdio switches a card to High Speed and doubles the clock" {
+    var host = FakeHost{ .high_speed = true, .csd = csd_with_switch };
+    const dev = initLow(&host, .{ .freq = 100_000_000, .high_speed = true }) orelse return error.SkipZigTest;
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expect(dev.in_high_speed);
+    try std.testing.expect(host.switched);
+    try std.testing.expectEqual(@as(usize, 2), host.switch_cmds);
+    // 100 MHz / (2 * 50 MHz) - 1 = 0.
+    try std.testing.expectEqual(@as(u32, 0), host.clk_div);
+    // The block size is back at 512 for the reads.
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
+    try std.testing.expectEqual(@as(u32, 512), host.blk_size);
+}
+
+test "harbor_sdio keeps the default speed without the option, the class or the function" {
+    var off = FakeHost{ .high_speed = true, .csd = csd_with_switch };
+    var dev = initLow(&off, .{ .freq = 100_000_000 }) orelse return error.SkipZigTest;
+    try std.testing.expect(!dev.in_high_speed);
+    try std.testing.expectEqual(@as(usize, 0), off.switch_cmds);
+
+    var old = FakeHost{ .high_speed = true };
+    dev = initLow(&old, .{ .freq = 100_000_000, .high_speed = true }).?;
+    try std.testing.expect(!dev.in_high_speed);
+    try std.testing.expectEqual(@as(usize, 0), old.switch_cmds);
+
+    var slow = FakeHost{ .csd = csd_with_switch };
+    dev = initLow(&slow, .{ .freq = 100_000_000, .high_speed = true }).?;
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expect(!dev.in_high_speed);
+    // The check showed no High Speed, so no switch went out.
+    try std.testing.expectEqual(@as(usize, 1), slow.switch_cmds);
+    try std.testing.expect(!slow.switched);
+    // 100 MHz / (2 * 25 MHz) - 1 = 1.
+    try std.testing.expectEqual(@as(u32, 1), slow.clk_div);
+}
+
+test "harbor_sdio limits the clock to the maximum of the board" {
+    var host = FakeHost{ .high_speed = true, .csd = csd_with_switch };
+    const dev = initLow(&host, .{ .freq = 100_000_000, .high_speed = true, .max_hz = 40_000_000 }) orelse return error.SkipZigTest;
+    try std.testing.expect(dev.in_high_speed);
+    // 40 MHz is not a rate of the divider, so the next lower rate, 25 MHz.
+    try std.testing.expectEqual(@as(u32, 1), host.clk_div);
 }
