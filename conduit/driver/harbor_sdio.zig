@@ -61,6 +61,9 @@ pub const Options = struct {
     init_hz: u32 = 400_000,
     /// SD clock for data transfers, applied after identification.
     data_hz: u32 = 25_000_000,
+    /// A clock in microseconds. With it, the wait for DAT0 before CMD0 has a
+    /// limit of 500 ms. Without it, the limit is a count of register reads.
+    now_us: ?*const fn () u64 = null,
 };
 
 /// What the host and the card reported when a write failed.
@@ -77,6 +80,7 @@ pub const HarborSdio = struct {
     clk_freq: u32 = 0,
     bus_width: BusWidth = .four,
     data_hz: u32 = 25_000_000,
+    now_us: ?*const fn () u64 = null,
     rca: u32 = 0,
     high_capacity: bool = false,
     num_blocks: u64 = 0,
@@ -111,6 +115,13 @@ pub const HarborSdio = struct {
     const INT_STATUS = 0x60; // write-1-to-clear
     const INT_ENABLE = 0x68;
     const ADMA_ADDR = 0x70; // ADMA descriptor pointer (physical, 32-bit)
+    // The sampled levels of the bus. A host older than this register reads 0.
+    const DIAG = 0x90;
+    const DIAG_DAT0: u32 = 1 << 4;
+    // A card can hold DAT0 low for up to 500 ms while it programs. The read
+    // count is the limit when the driver has no clock.
+    const DAT0_WAIT_US: u64 = 500_000;
+    const DAT0_POLL_MAX: usize = 1_000_000;
 
     // STATUS is read-only.
     const ST_CARD_DETECT: u32 = 1 << 0;
@@ -280,6 +291,9 @@ pub const HarborSdio = struct {
         // CMD0 and CMD8 are the real presence test. `cardDetect()` stays public
         // for a board that knows its own CD wiring is good.
 
+        // A card that still programs holds DAT0 low and can miss CMD0. On a
+        // host with no DIAG the wait runs to its limit, then CMD0 goes out.
+        _ = self.waitDat0High();
         _ = self.cmd(GO_IDLE, 0, R_NONE) orelse return false;
 
         const if_cond = self.cmd(SEND_IF_COND, 0x1aa, R_SHORT);
@@ -331,6 +345,25 @@ pub const HarborSdio = struct {
         self.setClock(self.data_hz);
         self.present = true;
         return true;
+    }
+
+    // DIAG samples DAT0 through one flop, so a read while the line changes
+    // can give either level. Two high reads in a row count as high.
+    fn waitDat0High(self: *HarborSdio) bool {
+        var high: u32 = 0;
+        const end = if (self.now_us) |now| now() + DAT0_WAIT_US else 0;
+        var polls: usize = DAT0_POLL_MAX;
+        while (true) {
+            high = if (self.mmio.read(u32, DIAG) & DIAG_DAT0 != 0) high + 1 else 0;
+            if (high == 2) return true;
+            if (self.now_us) |now| {
+                if (now() >= end) break;
+            } else {
+                polls -= 1;
+                if (polls == 0) break;
+            }
+        }
+        return false;
     }
 
     fn setCardWidth(self: *HarborSdio) bool {
@@ -668,6 +701,7 @@ pub fn bind(mmio: Mmio, opts: Options) HarborSdio {
         .clk_freq = opts.freq,
         .bus_width = opts.bus_width,
         .data_hz = opts.data_hz,
+        .now_us = opts.now_us,
     };
     _ = dev.init();
     return dev;
@@ -709,6 +743,10 @@ const FakeHost = struct {
     writes: usize = 0,
     last_addr: u32 = 0,
     width_set: u32 = 0,
+    /// DIAG reports DAT0 low for this many reads. Null makes DIAG read 0,
+    /// as on a host older than the register.
+    dat0_low_reads: ?u32 = 0,
+    diag_reads: usize = 0,
     /// The card refuses ACMD6.
     refuse_width: bool = false,
     /// The card rejects each written block and stays in this state until
@@ -877,6 +915,15 @@ const FakeHost = struct {
             S.BLK_COUNT => self.blk_count,
             S.INT_STATUS => self.int_status,
             S.ADMA_ADDR => self.adma,
+            S.DIAG => blk: {
+                self.diag_reads += 1;
+                const left = self.dat0_low_reads orelse break :blk 0;
+                if (left > 0) {
+                    self.dat0_low_reads = left - 1;
+                    break :blk 0;
+                }
+                break :blk S.DIAG_DAT0;
+            },
             else => 0,
         };
     }
@@ -1309,4 +1356,35 @@ test "harbor_sdio keeps the last card status when the card stays busy" {
     var out: [512]u8 = @splat(0x66);
     try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
     try std.testing.expectEqual(@as(?u32, 7 << HarborSdio.CS_STATE_SHIFT), dev.fault.card_status);
+}
+
+test "harbor_sdio waits for DAT0 high before CMD0" {
+    var host = FakeHost{ .dat0_low_reads = 50 };
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.cardPresent());
+    // 50 low reads, then two high reads.
+    try std.testing.expectEqual(@as(usize, 52), host.diag_reads);
+}
+
+test "harbor_sdio sends CMD0 on a host with no DIAG register" {
+    var host = FakeHost{ .dat0_low_reads = null };
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expectEqual(HarborSdio.DAT0_POLL_MAX, host.diag_reads);
+}
+
+var fake_clock_us: u64 = 0;
+
+fn fakeNow() u64 {
+    fake_clock_us += 1000;
+    return fake_clock_us;
+}
+
+test "harbor_sdio limits the wait for DAT0 by time when it has a clock" {
+    var host = FakeHost{ .dat0_low_reads = null };
+    fake_clock_us = 0;
+    var dev = bind(host.mmio(), .{ .freq = 50_000_000, .now_us = fakeNow });
+    try std.testing.expect(dev.cardPresent());
+    // Each clock read moves 1 ms, so 500 ms is 500 reads after the start.
+    try std.testing.expectEqual(@as(usize, 500), host.diag_reads);
 }

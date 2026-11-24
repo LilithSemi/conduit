@@ -943,7 +943,7 @@ test "clint: timer and IPI registers" {
 test "harbor_sdio: a dead controller yields an empty block device" {
     // A flat register file never drives a response, so every command reports a
     // timeout and identification must give up rather than report a phantom card.
-    var regs = fake.Flat(128){};
+    var regs = fake.Flat(0x100){};
     var dev = harbor_sdio.bind(regs.mmio(), .{ .freq = 50_000_000 });
     try std.testing.expect(!dev.cardPresent());
 
