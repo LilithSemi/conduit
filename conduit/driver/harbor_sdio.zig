@@ -143,8 +143,8 @@ pub const HarborSdio = struct {
     const ST_DATA_VALID: u32 = 1 << 9; // a block word is ready to pop from DATA
 
     // CTRL[0] enable, CTRL[5:4] active bus width (0:1-bit, 1:4-bit, 2:8-bit),
-    // CTRL[8] sample the card on the falling clock edge. The reset value of
-    // bit 8 is the choice of the board, so the driver keeps it.
+    // CTRL[8] sample the card on the falling clock edge. A build can fix bit 8,
+    // and then a write does not change it.
     const CTRL_ENABLE: u32 = 1 << 0;
     const CTRL_WIDTH_SHIFT: u5 = 4;
     const CTRL_SAMPLE_FALL: u32 = 1 << 8;
@@ -199,6 +199,8 @@ pub const HarborSdio = struct {
     const SET_BUS_WIDTH = 6; // ACMD6, arg 2 = 4-bit
     const SWITCH_FUNC = 6; // CMD6, with a 64 byte status on DAT
     const HIGH_SPEED_HZ = 50_000_000;
+    // At or below this clock, either sample edge has margin for the card.
+    const EDGE_FREE_HZ = 12_500_000;
     // Mode 0 checks and mode 1 sets function 1 of group 1 (High Speed). The
     // other groups keep their function (0xf).
     const SWITCH_CHECK_HS: u32 = 0x00ff_fff1;
@@ -285,6 +287,25 @@ pub const HarborSdio = struct {
         self.clock_hz = self.clk_freq / (2 * half);
     }
 
+    fn limit(self: *const HarborSdio, hz: u32) u32 {
+        return if (self.max_hz != 0) @min(hz, self.max_hz) else hz;
+    }
+
+    /// The SD clock that `setClock(hz)` gives. Unknown when the input clock is
+    /// unknown, so then the highest value.
+    fn rate(self: *const HarborSdio, hz: u32) u32 {
+        if (hz == 0 or self.clk_freq == 0) return std.math.maxInt(u32);
+        return self.clk_freq / (2 * (std.math.divCeil(u32, self.clk_freq, 2 * hz) catch unreachable));
+    }
+
+    /// Selects the sample edge. False when the build fixes the other edge.
+    fn setSampleFall(self: *HarborSdio, fall: bool) bool {
+        const want: u32 = if (fall) CTRL_SAMPLE_FALL else 0;
+        const ctrl = self.mmio.read(u32, CTRL) & ~CTRL_SAMPLE_FALL;
+        self.mmio.write(u32, CTRL, ctrl | want);
+        return self.mmio.read(u32, CTRL) & CTRL_SAMPLE_FALL == want;
+    }
+
     fn setCtrl(self: *HarborSdio, width: BusWidth) void {
         const w: u32 = @backingInt(width);
         const edge = self.mmio.read(u32, CTRL) & CTRL_SAMPLE_FALL;
@@ -365,10 +386,16 @@ pub const HarborSdio = struct {
         self.bus_width = width;
         self.setCtrl(width);
 
-        var hz = self.data_hz;
-        self.in_high_speed = self.high_speed and self.switch_class and self.switchHighSpeed();
-        if (self.in_high_speed) hz = HIGH_SPEED_HZ;
-        if (self.max_hz != 0) hz = @min(hz, self.max_hz);
+        // A card in High Speed changes DAT on the rising edge, so the host must
+        // sample on the rising edge. A build that fixes the falling edge stays in
+        // Default Speed, unless the High Speed clock is slow enough for any edge.
+        const hs_hz = self.limit(HIGH_SPEED_HZ);
+        const rise_ok = self.setSampleFall(false);
+        self.in_high_speed = self.high_speed and self.switch_class and
+            (rise_ok or self.rate(hs_hz) <= EDGE_FREE_HZ) and self.switchHighSpeed();
+        // In Default Speed the card changes DAT on the falling edge.
+        var hz = if (self.in_high_speed) hs_hz else self.limit(self.data_hz);
+        if (!self.setSampleFall(!self.in_high_speed)) hz = @min(hz, EDGE_FREE_HZ);
         self.setClock(hz);
         self.present = true;
         return true;
@@ -776,6 +803,9 @@ const FakeHost = struct {
 
     ctrl: u32 = 0,
     clk_div: u32 = 0,
+    /// The sample edge that the build fixes: true for the falling edge. Null
+    /// when CTRL[8] is writable.
+    edge_fixed: ?bool = null,
     cmd_arg: u32 = 0,
     blk_size: u32 = 0,
     blk_count: u32 = 0,
@@ -1009,7 +1039,10 @@ const FakeHost = struct {
         const self: *FakeHost = @ptrCast(@alignCast(ctx));
         const v: u32 = @truncate(val);
         switch (off) {
-            S.CTRL => self.ctrl = v,
+            S.CTRL => self.ctrl = if (self.edge_fixed) |fall|
+                v & ~S.CTRL_SAMPLE_FALL | (if (fall) S.CTRL_SAMPLE_FALL else 0)
+            else
+                v,
             S.CLK_DIV => self.clk_div = v,
             S.CMD_ARG => self.cmd_arg = v,
             S.CMD => {
@@ -1091,7 +1124,7 @@ test "harbor_sdio identifies an SDHC card, then reads and writes a block" {
     // ACMD6 asked the card for 4-bit, and CTRL[5:4] made the host match.
     try std.testing.expectEqual(@as(u32, 2), host.width_set);
     try std.testing.expectEqual(
-        HarborSdio.CTRL_ENABLE | (@as(u32, 1) << 4),
+        HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE | (@as(u32, 1) << 4),
         host.ctrl,
     );
     // 50 MHz / (2 * 25 MHz) - 1 = 0.
@@ -1137,7 +1170,7 @@ test "harbor_sdio runs a 1-bit card and leaves the bus narrow" {
     var dev = bind(host.mmio(), .{ .freq = 50_000_000, .bus_width = .one });
     try std.testing.expect(dev.cardPresent());
     try std.testing.expectEqual(@as(u32, 0), host.width_set); // no ACMD6
-    try std.testing.expectEqual(HarborSdio.CTRL_ENABLE, host.ctrl);
+    try std.testing.expectEqual(HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE, host.ctrl);
 }
 
 test "harbor_sdio reports a card that never answers CMD8/ACMD41" {
@@ -1290,20 +1323,6 @@ test "harbor_sdio clears the DMA fault bit so it cannot fail a later transfer" {
     try std.testing.expect(dev.block().readBlocks(7, 1, &buf));
 }
 
-test "harbor_sdio keeps the sample edge that the board selected" {
-    var host = FakeHost{ .ctrl = HarborSdio.CTRL_SAMPLE_FALL };
-    var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
-    try std.testing.expect(dev.cardPresent());
-    try std.testing.expectEqual(
-        HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE | (@as(u32, 1) << 4),
-        host.ctrl,
-    );
-
-    var narrow = FakeHost{ .ctrl = HarborSdio.CTRL_SAMPLE_FALL };
-    dev = bind(narrow.mmio(), .{ .freq = 50_000_000, .bus_width = .one });
-    try std.testing.expectEqual(HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE, narrow.ctrl);
-}
-
 test "harbor_sdio waits for the card to finish a block before it writes the next" {
     // The controller reports the end of the data phase at once. A driver that
     // trusts it sends the second block to a card that still programs the first.
@@ -1391,7 +1410,7 @@ test "harbor_sdio stays at 1 bit when the card refuses ACMD6" {
     var dev = bind(host.mmio(), .{ .freq = 50_000_000 });
     try std.testing.expect(dev.cardPresent());
     try std.testing.expectEqual(BusWidth.one, dev.bus_width);
-    try std.testing.expectEqual(HarborSdio.CTRL_ENABLE, host.ctrl);
+    try std.testing.expectEqual(HarborSdio.CTRL_SAMPLE_FALL | HarborSdio.CTRL_ENABLE, host.ctrl);
 }
 
 test "harbor_sdio stops a card that rejected a block and keeps the cause" {
