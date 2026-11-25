@@ -130,12 +130,16 @@ pub const HarborSdio = struct {
     const INT_ENABLE = 0x68;
     const ADMA_ADDR = 0x70; // ADMA descriptor pointer (physical, 32-bit)
     // The sampled levels of the bus. A host older than this register reads 0.
+    const DATA_TIMEOUT = 0x78; // SD clocks a read waits for a block start bit
+    const DATA_TIMEOUT_MAX: u32 = (1 << 24) - 1;
     const DIAG = 0x90;
     const DIAG_DAT0: u32 = 1 << 4;
     // A card can hold DAT0 low for up to 500 ms while it programs. The read
     // count is the limit when the driver has no clock.
     const DAT0_WAIT_US: u64 = 500_000;
     const DAT0_POLL_MAX: usize = 1_000_000;
+    // An SDXC card can program a block for up to 500 ms.
+    const WRITE_BUSY_US: u64 = 500_000;
 
     // STATUS is read-only.
     const ST_CARD_DETECT: u32 = 1 << 0;
@@ -285,6 +289,8 @@ pub const HarborSdio = struct {
         const half = std.math.divCeil(u32, self.clk_freq, 2 * hz) catch unreachable;
         self.mmio.write(u32, CLK_DIV, half - 1);
         self.clock_hz = self.clk_freq / (2 * half);
+        // A card starts a read block within 100 ms. Wait 250 ms.
+        self.mmio.write(u32, DATA_TIMEOUT, @min(self.clock_hz / 4, DATA_TIMEOUT_MAX));
     }
 
     fn limit(self: *const HarborSdio, hz: u32) u32 {
@@ -405,19 +411,31 @@ pub const HarborSdio = struct {
     // can give either level. Two high reads in a row count as high.
     fn waitDat0High(self: *HarborSdio) bool {
         var high: u32 = 0;
-        const end = if (self.now_us) |now| now() + DAT0_WAIT_US else 0;
-        var polls: usize = DAT0_POLL_MAX;
+        var wait = self.deadline(DAT0_WAIT_US, DAT0_POLL_MAX);
         while (true) {
             high = if (self.mmio.read(u32, DIAG) & DIAG_DAT0 != 0) high + 1 else 0;
             if (high == 2) return true;
-            if (self.now_us) |now| {
-                if (now() >= end) break;
-            } else {
-                polls -= 1;
-                if (polls == 0) break;
-            }
+            if (wait.over()) return false;
         }
-        return false;
+    }
+
+    // Ends after `us` when the driver has a clock, else after `polls` checks.
+    const Deadline = struct {
+        now: ?*const fn () u64,
+        end: u64,
+        polls: usize,
+
+        fn over(self: *Deadline) bool {
+            if (self.now) |now| return now() >= self.end;
+            if (self.polls <= 1) return true;
+            self.polls -= 1;
+            return false;
+        }
+    };
+
+    fn deadline(self: *const HarborSdio, us: u64, polls: usize) Deadline {
+        const start = if (self.now_us) |now| now() else 0;
+        return .{ .now = self.now_us, .end = start + us, .polls = polls };
     }
 
     // CMD6 in mode 0, then in mode 1. Each gives a 64 byte status, with the
@@ -663,8 +681,8 @@ pub const HarborSdio = struct {
     // programmed the block, and a card in the programming state does not take
     // the next data command. A card that does not answer fails the wait.
     fn waitTransfer(self: *HarborSdio) bool {
-        var polls = self.ready_polls;
-        while (polls > 0) : (polls -= 1) {
+        var wait = self.deadline(WRITE_BUSY_US, self.ready_polls);
+        while (true) {
             self.last_status = null;
             const resp = self.cmd(SEND_STATUS, self.rca << 16, R_SHORT) orelse return false;
             const card = resp[0];
@@ -672,8 +690,8 @@ pub const HarborSdio = struct {
             if (card & CS_ERRORS != 0) return false;
             const state = (card >> CS_STATE_SHIFT) & CS_STATE_MASK;
             if (state == CS_STATE_TRANSFER and card & CS_READY_FOR_DATA != 0) return true;
+            if (wait.over()) return false;
         }
-        return false;
     }
 
     /// Convert a logical block address to the card's addressing (block for
@@ -806,6 +824,7 @@ const FakeHost = struct {
     /// The sample edge that the build fixes: true for the falling edge. Null
     /// when CTRL[8] is writable.
     edge_fixed: ?bool = null,
+    data_timeout: u32 = 1 << 22,
     cmd_arg: u32 = 0,
     blk_size: u32 = 0,
     blk_count: u32 = 0,
@@ -1054,6 +1073,7 @@ const FakeHost = struct {
             S.BLK_COUNT => self.blk_count = v,
             S.INT_STATUS => self.int_status &= ~v, // write-1-to-clear
             S.ADMA_ADDR => self.adma = v,
+            S.DATA_TIMEOUT => self.data_timeout = v,
             else => {},
         }
     }
@@ -1551,4 +1571,24 @@ test "harbor_sdio limits the clock to the maximum of the board" {
     // 40 MHz is not a rate of the divider, so the next lower rate, 25 MHz.
     try std.testing.expectEqual(@as(u32, 1), host.clk_div);
     try std.testing.expectEqual(@as(u32, 25_000_000), dev.clock_hz);
+}
+
+test "harbor_sdio waits 250 ms for a read block" {
+    var host = FakeHost{};
+    const dev = bind(host.mmio(), .{ .freq = 50_000_000 });
+    try std.testing.expect(dev.cardPresent());
+    try std.testing.expectEqual(@as(u32, 25_000_000), dev.clock_hz);
+    try std.testing.expectEqual(@as(u32, 6_250_000), host.data_timeout);
+}
+
+test "harbor_sdio waits 500 ms for a card that programs when it has a clock" {
+    var host = FakeHost{ .program_polls = 100_000 };
+    const dev = lowInstance() orelse return error.SkipZigTest;
+    dev.* = bind(host.mmio(), .{ .freq = 50_000_000, .now_us = fakeNow });
+    fake_clock_us = 0;
+
+    var out: [512]u8 = @splat(0x44);
+    try std.testing.expect(!dev.block().writeBlocks(3, 1, &out));
+    // Each clock read moves 1 ms, so 500 ms is 500 status reads after the start.
+    try std.testing.expectEqual(@as(usize, 500), host.status_polls);
 }
